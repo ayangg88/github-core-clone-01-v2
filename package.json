@@ -1,0 +1,14 @@
+{
+  "name": "github-core-clone-01-v2",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "A fast GitHub-compatible git forge: single-inflate pack parsing, cached fetches and pre-rendered issue JSON in one TypeScript server",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22.18"
+  },
+  "scripts": {
+    "start": "node --experimental-strip-types main.ts"
+  }
+}
