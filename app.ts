@@ -10,16 +10,16 @@
 //     inflateSync(buf, {info:true}) reports the input bytes the engine
 //     consumed (engine.bytesWritten), so there is no binary search over
 //     the stream to find its end (the classic O(log n) re-inflate loop).
-//   * Parsed commits and trees are cached per repository (objects are
+//   * Parsed commits and trees are cached per forge (objects are
 //     immutable, so the cache never goes stale); every reachability walk,
 //     ancestor check and tree lookup reuses parsed forms.
 //   * Fetch responses are cached whole: a shallow clone of an unchanged
 //     tip always produces the same bytes, so the 50-concurrent-clone
 //     workload pays the pack build once and then serves a Buffer.
-//   * Hot REST paths (GET one issue, POST one issue — the read/write
+//   * Hot REST paths (GET one ticket, POST one ticket — the read/write
 //     workloads) never build a URL object, never JSON.stringify a fresh
 //     object graph, and serve a pre-rendered JSON string kept on the
-//     issue itself, rebuilt only when that issue mutates.
+//     ticket itself, rebuilt only when that ticket mutates.
 //   * Routing splits the raw request target by hand; `new URL` is only
 //     built when a handler actually needs query parameters.
 //   * SHA-1 hashes stream header+data instead of concatenating a copy.
@@ -59,7 +59,7 @@ interface CommitInfo { tree: string; parents: string[]; author: string; committe
 interface TagInfo { object: string; type: string; tag: string; tagger: string; message: string }
 
 // Parse caches: git objects are immutable, so a parsed form stays valid
-// for the life of the process. Keyed per repository to bound growth.
+// for the life of the process. Keyed per forge to bound growth.
 function parseTreeRaw(data: Buffer): TreeEntry[] {
   const out: TreeEntry[] = [];
   let off = 0;
@@ -307,15 +307,15 @@ function decodePktLines(buf: Buffer): { lines: string[]; rest: Buffer } | null {
 }
 
 // ---------------------------------------------------------------- store
-interface Issue {
+interface Ticket {
   id: string; number: number; title: string; body: string; state: 'open' | 'closed';
   labels: { name: string; color: string }[]; seq: number; closedAt: string | null;
   comments: { id: number; body: string; createdAt: string }[];
-  // Pre-rendered REST JSON for this issue + its byte length. Rebuilt by
-  // refreshIssueJson() whenever the issue mutates; the read workload then
+  // Pre-rendered REST JSON for this ticket + its byte length. Rebuilt by
+  // refreshTicketJson() whenever the ticket mutates; the read workload then
   // serves bytes without building or stringifying anything.
   // labelJson is the fixed labels fragment (labels never change after
-  // creation); jsonOwner is the repo owner the cached text was rendered for.
+  // creation); jsonOwner is the forge owner the cached text was rendered for.
   json: string; jsonLen: number; labelJson: string; jsonOwner: string | null;
 }
 interface Pull {
@@ -324,12 +324,12 @@ interface Pull {
   headRef: string; baseRef: string; headSha: string; baseSha: string;
   baseAtCreate: string; seq: number;
 }
-interface Repo {
+interface Forge {
   name: string; owner: string | null; description: string; isPrivate: boolean;
   defaultBranch: string; dbId: number; globalId: string; seq: number;
   refs: Map<string, string>; objects: Map<string, GitObj>;
   labels: Map<string, { name: string; color: string }>;
-  issues: Issue[]; issueByNumber: Map<number, Issue>;
+  tickets: Ticket[]; ticketByNumber: Map<number, Ticket>;
   pulls: Pull[]; nextNumber: number; nextCommentId: number;
   // Parsed-object caches (objects are immutable).
   commitCache: Map<string, CommitInfo>;
@@ -339,12 +339,12 @@ interface Repo {
   // section included). Only for have-less fetches of one tip.
   fetchCache: Map<string, Buffer>;
 }
-const repos = new Map<string, Repo>();
-let repoCounter = 0;
+const forges = new Map<string, Forge>();
+let forgeCounter = 0;
 function globalId(kind: string, n: number | string): string {
   return `${kind}_${b64url(`${kind}:${n}`)}`;
 }
-function repoGlobalId(repo: Repo): string { return repo.globalId; }
+function forgeGlobalId(forge: Forge): string { return forge.globalId; }
 function decodeGlobalId(id: string): { kind: string; dbId: number; rest: string } | null {
   const m = /^([A-Z]+)_(.+)$/.exec(id);
   if (!m) return null;
@@ -366,77 +366,77 @@ function decodeCursor(s: string): number {
     return m ? Number(m[1]) : -1;
   } catch { return -1; }
 }
-function newRepo(name: string, isPrivate: boolean, description: string): Repo {
-  repoCounter += 1;
-  const dbId = repoCounter;
-  const repo: Repo = {
+function newForge(name: string, isPrivate: boolean, description: string): Forge {
+  forgeCounter += 1;
+  const dbId = forgeCounter;
+  const forge: Forge = {
     name, owner: null, description, isPrivate, defaultBranch: 'main', dbId,
     globalId: globalId('R', dbId), seq: nextSeq(),
     refs: new Map(), objects: new Map(), labels: new Map(),
-    issues: [], issueByNumber: new Map(), pulls: [], nextNumber: 1, nextCommentId: 1,
+    tickets: [], ticketByNumber: new Map(), pulls: [], nextNumber: 1, nextCommentId: 1,
     commitCache: new Map(), treeCache: new Map(), tagCache: new Map(),
     fetchCache: new Map(),
   };
-  repos.set(name, repo);
-  return repo;
+  forges.set(name, forge);
+  return forge;
 }
-function repoByName(name: string): Repo | undefined { return repos.get(name); }
-function repoFor(owner: string, name: string): Repo | null {
-  const repo = repos.get(name);
-  if (!repo) return null;
-  if (repo.owner === null) repo.owner = owner;
-  if (repo.owner !== owner) return null;
-  return repo;
+function forgeByName(name: string): Forge | undefined { return forges.get(name); }
+function forgeFor(owner: string, name: string): Forge | null {
+  const forge = forges.get(name);
+  if (!forge) return null;
+  if (forge.owner === null) forge.owner = owner;
+  if (forge.owner !== owner) return null;
+  return forge;
 }
-// Any ref/object change invalidates the fetch cache for that repo.
-function invalidateFetchCache(repo: Repo): void { repo.fetchCache.clear(); }
-function putObj(repo: Repo, type: string, data: Buffer): string {
+// Any ref/object change invalidates the fetch cache for that forge.
+function invalidateFetchCache(forge: Forge): void { forge.fetchCache.clear(); }
+function putObj(forge: Forge, type: string, data: Buffer): string {
   const oid = hashObject(type, data);
-  if (!repo.objects.has(oid)) repo.objects.set(oid, { type, data });
+  if (!forge.objects.has(oid)) forge.objects.set(oid, { type, data });
   return oid;
 }
-// Cached accessors over a repo's objects.
-function getCommit(repo: Repo, oid: string): CommitInfo | null {
-  const hit = repo.commitCache.get(oid);
+// Cached accessors over a forge's objects.
+function getCommit(forge: Forge, oid: string): CommitInfo | null {
+  const hit = forge.commitCache.get(oid);
   if (hit) return hit;
-  const obj = repo.objects.get(oid);
+  const obj = forge.objects.get(oid);
   if (!obj || obj.type !== 'commit') return null;
   const c = parseCommitRaw(obj.data);
-  repo.commitCache.set(oid, c);
+  forge.commitCache.set(oid, c);
   return c;
 }
-function getTree(repo: Repo, oid: string): TreeEntry[] | null {
-  const hit = repo.treeCache.get(oid);
+function getTree(forge: Forge, oid: string): TreeEntry[] | null {
+  const hit = forge.treeCache.get(oid);
   if (hit) return hit;
-  const obj = repo.objects.get(oid);
+  const obj = forge.objects.get(oid);
   if (!obj || obj.type !== 'tree') return null;
   const t = parseTreeRaw(obj.data);
-  repo.treeCache.set(oid, t);
+  forge.treeCache.set(oid, t);
   return t;
 }
-function getTag(repo: Repo, oid: string): TagInfo | null {
-  const hit = repo.tagCache.get(oid);
+function getTag(forge: Forge, oid: string): TagInfo | null {
+  const hit = forge.tagCache.get(oid);
   if (hit) return hit;
-  const obj = repo.objects.get(oid);
+  const obj = forge.objects.get(oid);
   if (!obj || obj.type !== 'tag') return null;
   const t = parseTagRaw(obj.data);
-  repo.tagCache.set(oid, t);
+  forge.tagCache.set(oid, t);
   return t;
 }
-function repoTip(repo: Repo, ref: string): string | null {
-  return repo.refs.get(`refs/heads/${ref}`) ?? null;
+function forgeTip(forge: Forge, ref: string): string | null {
+  return forge.refs.get(`refs/heads/${ref}`) ?? null;
 }
-function refCommit(repo: Repo, ref: string): string | null {
-  if (repo.refs.has(ref)) return repo.refs.get(ref) ?? null;
-  if (repo.refs.has(`refs/heads/${ref}`)) return repo.refs.get(`refs/heads/${ref}`) ?? null;
-  if (isOid(ref)) return repo.objects.has(ref) ? ref : null;
+function refCommit(forge: Forge, ref: string): string | null {
+  if (forge.refs.has(ref)) return forge.refs.get(ref) ?? null;
+  if (forge.refs.has(`refs/heads/${ref}`)) return forge.refs.get(`refs/heads/${ref}`) ?? null;
+  if (isOid(ref)) return forge.objects.has(ref) ? ref : null;
   return null;
 }
-function commitAtRef(repo: Repo, ref: string | undefined): string | null {
-  if (!ref) return repoTip(repo, repo.defaultBranch);
-  return refCommit(repo, ref);
+function commitAtRef(forge: Forge, ref: string | undefined): string | null {
+  if (!ref) return forgeTip(forge, forge.defaultBranch);
+  return refCommit(forge, ref);
 }
-function commitsFrom(repo: Repo, tip: string | null): { sha: string; commit: CommitInfo }[] {
+function commitsFrom(forge: Forge, tip: string | null): { sha: string; commit: CommitInfo }[] {
   if (!tip) return [];
   const out: { sha: string; commit: CommitInfo }[] = [];
   const seen = new Set<string>();
@@ -446,46 +446,46 @@ function commitsFrom(repo: Repo, tip: string | null): { sha: string; commit: Com
     const oid = queue[head++] as string;
     if (seen.has(oid)) continue;
     seen.add(oid);
-    const c = getCommit(repo, oid);
+    const c = getCommit(forge, oid);
     if (!c) continue;
     out.push({ sha: oid, commit: c });
     for (const p of c.parents) queue.push(p);
   }
   return out;
 }
-function collectReachable(repo: Repo, tips: string[]): Set<string> {
+function collectReachable(forge: Forge, tips: string[]): Set<string> {
   const seen = new Set<string>();
   const queue: string[] = [...tips];
   let head = 0;
   while (head < queue.length) {
     const oid = queue[head++] as string;
     if (seen.has(oid)) continue;
-    const obj = repo.objects.get(oid);
+    const obj = forge.objects.get(oid);
     if (!obj) continue;
     seen.add(oid);
     if (obj.type === 'commit') {
-      const c = getCommit(repo, oid);
+      const c = getCommit(forge, oid);
       if (!c) continue;
       queue.push(c.tree);
       for (const p of c.parents) queue.push(p);
     } else if (obj.type === 'tree') {
-      const entries = getTree(repo, oid);
+      const entries = getTree(forge, oid);
       if (entries) for (const e of entries) queue.push(e.oid);
     } else if (obj.type === 'tag') {
-      const t = getTag(repo, oid);
+      const t = getTag(forge, oid);
       if (t) queue.push(t.object);
     }
   }
   return seen;
 }
-function peelToCommit(repo: Repo, oid: string): string | null {
+function peelToCommit(forge: Forge, oid: string): string | null {
   let cur = oid;
   for (let i = 0; i < 10; i += 1) {
-    const obj = repo.objects.get(cur);
+    const obj = forge.objects.get(cur);
     if (!obj) return null;
     if (obj.type === 'commit') return cur;
     if (obj.type === 'tag') {
-      const t = getTag(repo, cur);
+      const t = getTag(forge, cur);
       if (!t) return null;
       cur = t.object;
       continue;
@@ -494,7 +494,7 @@ function peelToCommit(repo: Repo, oid: string): string | null {
   }
   return null;
 }
-function isAncestor(repo: Repo, anc: string, tip: string): boolean {
+function isAncestor(forge: Forge, anc: string, tip: string): boolean {
   if (anc === tip) return true;
   const seen = new Set<string>();
   const queue = [tip];
@@ -504,17 +504,17 @@ function isAncestor(repo: Repo, anc: string, tip: string): boolean {
     if (oid === anc) return true;
     if (seen.has(oid)) continue;
     seen.add(oid);
-    const c = getCommit(repo, oid);
+    const c = getCommit(forge, oid);
     if (!c) continue;
     for (const p of c.parents) queue.push(p);
   }
   return false;
 }
-function treeGet(repo: Repo, treeOid: string, path: string): { oid: string; mode: string } | null {
+function treeGet(forge: Forge, treeOid: string, path: string): { oid: string; mode: string } | null {
   const parts = path.split('/').filter((p) => p !== '');
   let cur = treeOid;
   for (let i = 0; i < parts.length; i += 1) {
-    const entries = getTree(repo, cur);
+    const entries = getTree(forge, cur);
     if (!entries) return null;
     const entry = entries.find((e) => e.name === parts[i]);
     if (!entry) return null;
@@ -523,16 +523,16 @@ function treeGet(repo: Repo, treeOid: string, path: string): { oid: string; mode
   }
   return null;
 }
-function treeList(repo: Repo, treeOid: string, path: string): TreeEntry[] | null {
-  if (path === '' || path === '/') return getTree(repo, treeOid);
-  const found = treeGet(repo, treeOid, path);
+function treeList(forge: Forge, treeOid: string, path: string): TreeEntry[] | null {
+  if (path === '' || path === '/') return getTree(forge, treeOid);
+  const found = treeGet(forge, treeOid, path);
   if (!found || found.mode !== '40000') return null;
-  return getTree(repo, found.oid);
+  return getTree(forge, found.oid);
 }
-function treeSet(repo: Repo, baseTreeOid: string | null, path: string, blobOid: string | null): string {
+function treeSet(forge: Forge, baseTreeOid: string | null, path: string, blobOid: string | null): string {
   const parts = path.split('/').filter((p) => p !== '');
   function rec(treeOid: string | null, depth: number): string {
-    const entries: TreeEntry[] = treeOid ? [...(getTree(repo, treeOid) ?? [])] : [];
+    const entries: TreeEntry[] = treeOid ? [...(getTree(forge, treeOid) ?? [])] : [];
     const name = parts[depth] as string;
     if (depth === parts.length - 1) {
       const idx = entries.findIndex((e) => e.name === name);
@@ -546,16 +546,16 @@ function treeSet(repo: Repo, baseTreeOid: string | null, path: string, blobOid: 
       else entries.push({ mode: '40000', name, oid: child });
     }
     const data = buildTree(entries);
-    return putObj(repo, 'tree', data);
+    return putObj(forge, 'tree', data);
   }
   return rec(baseTreeOid, 0);
 }
-function treeDiff(repo: Repo, oldTree: string | null, newTree: string | null): { path: string; status: string; oldOid: string | null; newOid: string | null }[] {
+function treeDiff(forge: Forge, oldTree: string | null, newTree: string | null): { path: string; status: string; oldOid: string | null; newOid: string | null }[] {
   const flat = (treeOid: string | null): Map<string, string> => {
     const m = new Map<string, string>();
     if (!treeOid) return m;
     const walk = (oid: string, prefix: string): void => {
-      const entries = getTree(repo, oid);
+      const entries = getTree(forge, oid);
       if (!entries) return;
       for (const e of entries) {
         const p = prefix === '' ? e.name : `${prefix}/${e.name}`;
@@ -576,27 +576,27 @@ function treeDiff(repo: Repo, oldTree: string | null, newTree: string | null): {
   }
   return out;
 }
-function lineCounts(repo: Repo, oid: string | null): number {
+function lineCounts(forge: Forge, oid: string | null): number {
   if (!oid) return 0;
-  const obj = repo.objects.get(oid);
+  const obj = forge.objects.get(oid);
   if (!obj) return 0;
   const s = obj.data.toString('utf8');
   if (s === '') return 0;
   return s.split('\n').length - (s.endsWith('\n') ? 1 : 0);
 }
-function mergeBase(repo: Repo, a: string, b: string): string | null {
+function mergeBase(forge: Forge, a: string, b: string): string | null {
   const aAnc = new Set<string>();
-  const aq: string[] = [peelToCommit(repo, a) ?? a];
+  const aq: string[] = [peelToCommit(forge, a) ?? a];
   let ah = 0;
   while (ah < aq.length) {
     const oid = aq[ah++] as string;
     if (aAnc.has(oid)) continue;
-    const c = getCommit(repo, oid);
+    const c = getCommit(forge, oid);
     if (!c) continue;
     aAnc.add(oid);
     for (const p of c.parents) aq.push(p);
   }
-  const bq: string[] = [peelToCommit(repo, b) ?? b];
+  const bq: string[] = [peelToCommit(forge, b) ?? b];
   const seen = new Set<string>();
   let bh = 0;
   while (bh < bq.length) {
@@ -604,51 +604,51 @@ function mergeBase(repo: Repo, a: string, b: string): string | null {
     if (seen.has(oid)) continue;
     seen.add(oid);
     if (aAnc.has(oid)) return oid;
-    const c = getCommit(repo, oid);
+    const c = getCommit(forge, oid);
     if (!c) continue;
     for (const p of c.parents) bq.push(p);
   }
   return null;
 }
-function prFiles(repo: Repo, pr: Pull): { filename: string; status: string; additions: number; deletions: number; changes: number }[] {
-  const baseTip = repoTip(repo, pr.baseRef) ?? pr.baseAtCreate;
-  const mb = mergeBase(repo, pr.headSha, baseTip) ?? pr.baseAtCreate;
-  const baseCommit = getCommit(repo, mb);
-  const headCommit = getCommit(repo, pr.headSha);
+function prFiles(forge: Forge, pr: Pull): { filename: string; status: string; additions: number; deletions: number; changes: number }[] {
+  const baseTip = forgeTip(forge, pr.baseRef) ?? pr.baseAtCreate;
+  const mb = mergeBase(forge, pr.headSha, baseTip) ?? pr.baseAtCreate;
+  const baseCommit = getCommit(forge, mb);
+  const headCommit = getCommit(forge, pr.headSha);
   const baseTree = baseCommit ? baseCommit.tree : null;
   const headTree = headCommit ? headCommit.tree : null;
-  return treeDiff(repo, baseTree, headTree).map((d) => {
-    const additions = d.status === 'removed' ? 0 : lineCounts(repo, d.newOid);
-    const deletions = d.status === 'added' ? 0 : lineCounts(repo, d.oldOid);
+  return treeDiff(forge, baseTree, headTree).map((d) => {
+    const additions = d.status === 'removed' ? 0 : lineCounts(forge, d.newOid);
+    const deletions = d.status === 'added' ? 0 : lineCounts(forge, d.oldOid);
     return { filename: d.path, status: d.status, additions, deletions, changes: additions + deletions };
   });
 }
-function prMergeable(repo: Repo, pr: Pull): boolean {
-  const baseTip = repoTip(repo, pr.baseRef);
+function prMergeable(forge: Forge, pr: Pull): boolean {
+  const baseTip = forgeTip(forge, pr.baseRef);
   if (!baseTip || baseTip === pr.baseAtCreate) return true;
-  const mb = mergeBase(repo, pr.headSha, baseTip) ?? pr.baseAtCreate;
-  const baseCommit = getCommit(repo, mb);
-  const headCommit = getCommit(repo, pr.headSha);
-  const curBaseCommit = getCommit(repo, baseTip);
+  const mb = mergeBase(forge, pr.headSha, baseTip) ?? pr.baseAtCreate;
+  const baseCommit = getCommit(forge, mb);
+  const headCommit = getCommit(forge, pr.headSha);
+  const curBaseCommit = getCommit(forge, baseTip);
   if (!baseCommit || !headCommit || !curBaseCommit) return false;
-  const headChanges = new Map(treeDiff(repo, baseCommit.tree, headCommit.tree).map((d) => [d.path, d.newOid]));
-  const baseChanges = new Map(treeDiff(repo, baseCommit.tree, curBaseCommit.tree).map((d) => [d.path, d.newOid]));
+  const headChanges = new Map(treeDiff(forge, baseCommit.tree, headCommit.tree).map((d) => [d.path, d.newOid]));
+  const baseChanges = new Map(treeDiff(forge, baseCommit.tree, curBaseCommit.tree).map((d) => [d.path, d.newOid]));
   for (const [path, headOid] of headChanges) {
     if (baseChanges.has(path) && baseChanges.get(path) !== headOid) return false;
   }
   return true;
 }
-function squashMerge(repo: Repo, pr: Pull): string | null {
-  const baseTip = repoTip(repo, pr.baseRef);
-  const headCommit = getCommit(repo, pr.headSha);
-  const curBase = baseTip ? getCommit(repo, baseTip) : undefined;
+function squashMerge(forge: Forge, pr: Pull): string | null {
+  const baseTip = forgeTip(forge, pr.baseRef);
+  const headCommit = getCommit(forge, pr.headSha);
+  const curBase = baseTip ? getCommit(forge, baseTip) : undefined;
   if (!headCommit || !curBase || !baseTip) return null;
-  const mb = mergeBase(repo, pr.headSha, baseTip) ?? pr.baseAtCreate;
-  const mbCommit = getCommit(repo, mb);
+  const mb = mergeBase(forge, pr.headSha, baseTip) ?? pr.baseAtCreate;
+  const mbCommit = getCommit(forge, mb);
   if (!mbCommit) return null;
   const curFlat = new Map<string, string>();
   const walk = (oid: string, prefix: string): void => {
-    const entries = getTree(repo, oid);
+    const entries = getTree(forge, oid);
     if (!entries) return;
     for (const e of entries) {
       const p = prefix === '' ? e.name : `${prefix}/${e.name}`;
@@ -656,7 +656,7 @@ function squashMerge(repo: Repo, pr: Pull): string | null {
     }
   };
   walk(curBase.tree, '');
-  for (const d of treeDiff(repo, mbCommit.tree, headCommit.tree)) {
+  for (const d of treeDiff(forge, mbCommit.tree, headCommit.tree)) {
     if (d.newOid === null) curFlat.delete(d.path);
     else curFlat.set(d.path, d.newOid);
   }
@@ -672,21 +672,21 @@ function squashMerge(repo: Repo, pr: Pull): string | null {
     }
     for (const d of [...dirs].sort()) entries.push({ mode: '40000', name: d, oid: buildFromFlat(`${prefix}${d}/`) });
     const data = buildTree(entries);
-    return putObj(repo, 'tree', data);
+    return putObj(forge, 'tree', data);
   };
   const treeOid = buildFromFlat('');
   const t = stamp();
   const msg = `Merge pull request #${pr.number} from ${pr.headRef}\n\n${pr.title}\n`;
   const commitData = buildCommit(treeOid, [baseTip], ident(t.epoch), ident(t.epoch), msg);
-  const sha = putObj(repo, 'commit', commitData);
-  repo.refs.set(`refs/heads/${pr.baseRef}`, sha);
-  invalidateFetchCache(repo);
+  const sha = putObj(forge, 'commit', commitData);
+  forge.refs.set(`refs/heads/${pr.baseRef}`, sha);
+  invalidateFetchCache(forge);
   return sha;
 }
-function makeCommit(repo: Repo, treeOid: string, parents: string[], message: string): string {
+function makeCommit(forge: Forge, treeOid: string, parents: string[], message: string): string {
   const t = stamp();
   const data = buildCommit(treeOid, parents, ident(t.epoch), ident(t.epoch), message);
-  return putObj(repo, 'commit', data);
+  return putObj(forge, 'commit', data);
 }
 
 // ---------------------------------------------------------------- HTTP helpers
@@ -739,78 +739,78 @@ function queryOfRaw(raw: string): URLSearchParams {
 function dec(s: string): string { try { return decodeURIComponent(s); } catch { return s; } }
 
 // ---------------------------------------------------------------- REST shapes
-function repoJson(repo: Repo): Record<string, unknown> {
-  const owner = repo.owner ?? VIEWER.login;
+function forgeJson(forge: Forge): Record<string, unknown> {
+  const owner = forge.owner ?? VIEWER.login;
   return {
-    id: repo.globalId, node_id: repo.globalId, name: repo.name, full_name: `${owner}/${repo.name}`,
+    id: forge.globalId, node_id: forge.globalId, name: forge.name, full_name: `${owner}/${forge.name}`,
     owner: { login: owner, id: VIEWER.id, node_id: globalId('U', VIEWER.id), type: 'User', site_admin: false },
-    private: repo.isPrivate, html_url: `https://example.invalid/${owner}/${repo.name}`,
-    description: repo.description, fork: false, url: `/api/v3/repos/${owner}/${repo.name}`,
+    private: forge.isPrivate, html_url: `https://example.invalid/${owner}/${forge.name}`,
+    description: forge.description, fork: false, url: `/api/v3/repos/${owner}/${forge.name}`,
     created_at: ISO_NOW, updated_at: ISO_NOW, pushed_at: ISO_NOW,
-    git_url: `git://example.invalid/${owner}/${repo.name}.git`,
-    ssh_url: `git@example.invalid:${owner}/${repo.name}.git`,
-    clone_url: `https://example.invalid/${owner}/${repo.name}.git`,
+    git_url: `git://example.invalid/${owner}/${forge.name}.git`,
+    ssh_url: `git@example.invalid:${owner}/${forge.name}.git`,
+    clone_url: `https://example.invalid/${owner}/${forge.name}.git`,
     homepage: null, size: 0, stargazers_count: 0, watchers_count: 0, language: null,
     has_issues: true, has_projects: true, has_downloads: true, has_wiki: true, has_pages: false,
     has_discussions: false, forks_count: 0, mirror_url: null, archived: false, disabled: false,
-    open_issues_count: repo.issues.filter((i) => i.state === 'open').length + repo.pulls.filter((p) => p.state === 'open').length,
-    license: null, allow_forking: true, is_template: false, topics: [], visibility: repo.isPrivate ? 'private' : 'public',
-    forks: 0, open_issues: 0, watchers: 0, default_branch: repo.defaultBranch,
+    open_issues_count: forge.tickets.filter((i) => i.state === 'open').length + forge.pulls.filter((p) => p.state === 'open').length,
+    license: null, allow_forking: true, is_template: false, topics: [], visibility: forge.isPrivate ? 'private' : 'public',
+    forks: 0, open_issues: 0, watchers: 0, default_branch: forge.defaultBranch,
   };
 }
-function issueJson(repo: Repo, issue: Issue): Record<string, unknown> {
-  const owner = repo.owner ?? VIEWER.login;
+function ticketJson(forge: Forge, ticket: Ticket): Record<string, unknown> {
+  const owner = forge.owner ?? VIEWER.login;
   return {
-    id: issue.id, node_id: issue.id, number: issue.number, title: issue.title, body: issue.body,
-    state: issue.state, locked: false, assignee: null, assignees: [],
-    labels: issue.labels.map((l) => ({ id: globalId('L', `${repo.dbId}:${l.name}`), node_id: globalId('L', `${repo.dbId}:${l.name}`), name: l.name, color: l.color, description: '', default: false })),
+    id: ticket.id, node_id: ticket.id, number: ticket.number, title: ticket.title, body: ticket.body,
+    state: ticket.state, locked: false, assignee: null, assignees: [],
+    labels: ticket.labels.map((l) => ({ id: globalId('L', `${forge.dbId}:${l.name}`), node_id: globalId('L', `${forge.dbId}:${l.name}`), name: l.name, color: l.color, description: '', default: false })),
     user: { login: VIEWER.login, id: VIEWER.id, type: 'User' },
-    comments: issue.comments.length,
-    created_at: ISO_NOW, updated_at: ISO_NOW, closed_at: issue.closedAt,
+    comments: ticket.comments.length,
+    created_at: ISO_NOW, updated_at: ISO_NOW, closed_at: ticket.closedAt,
     author_association: 'OWNER',
-    html_url: `https://example.invalid/${owner}/${repo.name}/issues/${issue.number}`,
-    url: `/api/v3/repos/${owner}/${repo.name}/issues/${issue.number}`,
-    repository_url: `/api/v3/repos/${owner}/${repo.name}`,
-    labels_url: `/api/v3/repos/${owner}/${repo.name}/issues/${issue.number}/labels{/name}`,
-    comments_url: `/api/v3/repos/${owner}/${repo.name}/issues/${issue.number}/comments`,
-    events_url: `/api/v3/repos/${owner}/${repo.name}/issues/${issue.number}/events`,
+    html_url: `https://example.invalid/${owner}/${forge.name}/issues/${ticket.number}`,
+    url: `/api/v3/repos/${owner}/${forge.name}/issues/${ticket.number}`,
+    repository_url: `/api/v3/repos/${owner}/${forge.name}`,
+    labels_url: `/api/v3/repos/${owner}/${forge.name}/issues/${ticket.number}/labels{/name}`,
+    comments_url: `/api/v3/repos/${owner}/${forge.name}/issues/${ticket.number}/comments`,
+    events_url: `/api/v3/repos/${owner}/${forge.name}/issues/${ticket.number}/events`,
   };
 }
-// Re-render an issue's cached REST JSON (called once per mutation, never per read).
+// Re-render a ticket's cached REST JSON (called once per mutation, never per read).
 // Built by direct string templating instead of object + JSON.stringify:
-// same field order and values as issueJson(), a fraction of the work.
-function refreshIssueJson(repo: Repo, issue: Issue): void {
-  const owner = repo.owner ?? VIEWER.login;
-  const s = `{"id":${JSON.stringify(issue.id)},"node_id":${JSON.stringify(issue.id)},"number":${issue.number},"title":${JSON.stringify(issue.title)},"body":${JSON.stringify(issue.body)},"state":${JSON.stringify(issue.state)},"locked":false,"assignee":null,"assignees":[],"labels":[${issue.labelJson}],"user":{"login":${JSON.stringify(VIEWER.login)},"id":${VIEWER.id},"type":"User"},"comments":${issue.comments.length},"created_at":${JSON.stringify(ISO_NOW)},"updated_at":${JSON.stringify(ISO_NOW)},"closed_at":${issue.closedAt === null ? 'null' : JSON.stringify(issue.closedAt)},"author_association":"OWNER","html_url":${JSON.stringify(`https://example.invalid/${owner}/${repo.name}/issues/${issue.number}`)},"url":${JSON.stringify(`/api/v3/repos/${owner}/${repo.name}/issues/${issue.number}`)},"repository_url":${JSON.stringify(`/api/v3/repos/${owner}/${repo.name}`)},"labels_url":${JSON.stringify(`/api/v3/repos/${owner}/${repo.name}/issues/${issue.number}/labels{/name}`)},"comments_url":${JSON.stringify(`/api/v3/repos/${owner}/${repo.name}/issues/${issue.number}/comments`)},"events_url":${JSON.stringify(`/api/v3/repos/${owner}/${repo.name}/issues/${issue.number}/events`)}}\n`;
-  issue.json = s;
-  issue.jsonLen = Buffer.byteLength(s);
-  issue.jsonOwner = owner;
+// same field order and values as ticketJson(), a fraction of the work.
+function refreshTicketJson(forge: Forge, ticket: Ticket): void {
+  const owner = forge.owner ?? VIEWER.login;
+  const s = `{"id":${JSON.stringify(ticket.id)},"node_id":${JSON.stringify(ticket.id)},"number":${ticket.number},"title":${JSON.stringify(ticket.title)},"body":${JSON.stringify(ticket.body)},"state":${JSON.stringify(ticket.state)},"locked":false,"assignee":null,"assignees":[],"labels":[${ticket.labelJson}],"user":{"login":${JSON.stringify(VIEWER.login)},"id":${VIEWER.id},"type":"User"},"comments":${ticket.comments.length},"created_at":${JSON.stringify(ISO_NOW)},"updated_at":${JSON.stringify(ISO_NOW)},"closed_at":${ticket.closedAt === null ? 'null' : JSON.stringify(ticket.closedAt)},"author_association":"OWNER","html_url":${JSON.stringify(`https://example.invalid/${owner}/${forge.name}/issues/${ticket.number}`)},"url":${JSON.stringify(`/api/v3/repos/${owner}/${forge.name}/issues/${ticket.number}`)},"repository_url":${JSON.stringify(`/api/v3/repos/${owner}/${forge.name}`)},"labels_url":${JSON.stringify(`/api/v3/repos/${owner}/${forge.name}/issues/${ticket.number}/labels{/name}`)},"comments_url":${JSON.stringify(`/api/v3/repos/${owner}/${forge.name}/issues/${ticket.number}/comments`)},"events_url":${JSON.stringify(`/api/v3/repos/${owner}/${forge.name}/issues/${ticket.number}/events`)}}\n`;
+  ticket.json = s;
+  ticket.jsonLen = Buffer.byteLength(s);
+  ticket.jsonOwner = owner;
 }
-function addIssue(repo: Repo, issue: Issue): void {
+function addTicket(forge: Forge, ticket: Ticket): void {
   // Labels are fixed at creation: render their fragment once.
-  issue.labelJson = issue.labels.map((l) => {
-    const id = globalId('L', `${repo.dbId}:${l.name}`);
+  ticket.labelJson = ticket.labels.map((l) => {
+    const id = globalId('L', `${forge.dbId}:${l.name}`);
     return `{"id":${JSON.stringify(id)},"node_id":${JSON.stringify(id)},"name":${JSON.stringify(l.name)},"color":${JSON.stringify(l.color)},"description":"","default":false}`;
   }).join(',');
-  repo.issues.push(issue);
-  repo.issueByNumber.set(issue.number, issue);
-  refreshIssueJson(repo, issue);
+  forge.tickets.push(ticket);
+  forge.ticketByNumber.set(ticket.number, ticket);
+  refreshTicketJson(forge, ticket);
 }
-function pullJson(repo: Repo, pr: Pull): Record<string, unknown> {
-  const owner = repo.owner ?? VIEWER.login;
-  const mergeable = pr.state === 'open' ? prMergeable(repo, pr) : false;
+function pullJson(forge: Forge, pr: Pull): Record<string, unknown> {
+  const owner = forge.owner ?? VIEWER.login;
+  const mergeable = pr.state === 'open' ? prMergeable(forge, pr) : false;
   return {
     id: pr.id, node_id: pr.id, number: pr.number, title: pr.title, body: pr.body,
     state: pr.state, locked: false, draft: false,
     merged: pr.merged, merged_at: pr.mergedAt, merge_commit_sha: pr.mergeCommitSha,
     mergeable, mergeable_state: mergeable ? 'clean' : 'dirty',
-    head: { label: `${owner}:${pr.headRef}`, ref: pr.headRef, sha: pr.headSha, user: { login: owner, id: VIEWER.id, type: 'User' }, repo: { id: repo.globalId, name: repo.name, full_name: `${owner}/${repo.name}` } },
-    base: { label: `${owner}:${pr.baseRef}`, ref: pr.baseRef, sha: pr.baseSha, user: { login: owner, id: VIEWER.id, type: 'User' }, repo: { id: repo.globalId, name: repo.name, full_name: `${owner}/${repo.name}` } },
+    head: { label: `${owner}:${pr.headRef}`, ref: pr.headRef, sha: pr.headSha, user: { login: owner, id: VIEWER.id, type: 'User' }, repo: { id: forge.globalId, name: forge.name, full_name: `${owner}/${forge.name}` } },
+    base: { label: `${owner}:${pr.baseRef}`, ref: pr.baseRef, sha: pr.baseSha, user: { login: owner, id: VIEWER.id, type: 'User' }, repo: { id: forge.globalId, name: forge.name, full_name: `${owner}/${forge.name}` } },
     user: { login: VIEWER.login, id: VIEWER.id, type: 'User' },
     created_at: ISO_NOW, updated_at: ISO_NOW, closed_at: pr.state === 'open' ? null : ISO_NOW,
-    html_url: `https://example.invalid/${owner}/${repo.name}/pull/${pr.number}`,
-    url: `/api/v3/repos/${owner}/${repo.name}/pulls/${pr.number}`,
-    comments: 0, review_comments: 0, commits: 1, additions: 0, deletions: 0, changed_files: prFiles(repo, pr).length,
+    html_url: `https://example.invalid/${owner}/${forge.name}/pull/${pr.number}`,
+    url: `/api/v3/repos/${owner}/${forge.name}/pulls/${pr.number}`,
+    comments: 0, review_comments: 0, commits: 1, additions: 0, deletions: 0, changed_files: prFiles(forge, pr).length,
     author_association: 'OWNER', auto_merge: null, active_lock_reason: null,
   };
 }
@@ -851,8 +851,8 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, path: strin
   }
   if (rest === '/user/repos') {
     if (method === 'GET') {
-      const mine = [...repos.values()].filter((r) => r.owner === null || r.owner === VIEWER.login).sort((a, b) => a.seq - b.seq);
-      const { page, link } = paginate(mine.map((r) => repoJson(r)), q, req, path);
+      const mine = [...forges.values()].filter((r) => r.owner === null || r.owner === VIEWER.login).sort((a, b) => a.seq - b.seq);
+      const { page, link } = paginate(mine.map((r) => forgeJson(r)), q, req, path);
       sendJson(res, 200, page, linkHeaders(link));
       return true;
     }
@@ -862,9 +862,9 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, path: strin
       const body = (parsed.value ?? {}) as Record<string, unknown>;
       const name = typeof body.name === 'string' ? body.name : '';
       if (name === '' || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$/.test(name)) { sendJson(res, 422, { message: 'Validation Failed: name is invalid' }); return true; }
-      if (repos.has(name)) { sendJson(res, 422, { message: 'Repository creation failed.', errors: [{ resource: 'Repository', code: 'custom', field: 'name', message: 'name already exists on this account' }] }); return true; }
-      const repo = newRepo(name, body.private === true, typeof body.description === 'string' ? body.description : '');
-      sendJson(res, 201, repoJson(repo));
+      if (forges.has(name)) { sendJson(res, 422, { message: 'Repository creation failed.', errors: [{ resource: 'Repository', code: 'custom', field: 'name', message: 'name already exists on this account' }] }); return true; }
+      const forge = newForge(name, body.private === true, typeof body.description === 'string' ? body.description : '');
+      sendJson(res, 201, forgeJson(forge));
       return true;
     }
     sendJson(res, 404, { message: 'Not Found' });
@@ -873,23 +873,23 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, path: strin
   if (seg[0] === 'repos' && seg.length >= 3) {
     const owner = dec(seg[1] as string);
     const name = dec(seg[2] as string);
-    const repo = repoFor(owner, name);
+    const forge = forgeFor(owner, name);
     const tail = seg.slice(3);
-    if (!repo) { sendJson(res, 404, { message: 'Not Found' }); return true; }
-    const repoPath = `/api/v3/repos/${owner}/${name}`;
+    if (!forge) { sendJson(res, 404, { message: 'Not Found' }); return true; }
+    const forgePath = `/api/v3/repos/${owner}/${name}`;
     if (tail.length === 0) {
-      if (method === 'GET') { sendJson(res, 200, repoJson(repo)); return true; }
+      if (method === 'GET') { sendJson(res, 200, forgeJson(forge)); return true; }
       if (method === 'PATCH') {
         const parsed = await readJson(req);
         if (!parsed.ok) { sendJson(res, 400, { message: 'Problems parsing JSON' }); return true; }
         const body = (parsed.value ?? {}) as Record<string, unknown>;
-        if (typeof body.description === 'string') repo.description = body.description;
-        if (typeof body.default_branch === 'string' && repo.refs.has(`refs/heads/${body.default_branch}`)) repo.defaultBranch = body.default_branch;
-        sendJson(res, 200, repoJson(repo));
+        if (typeof body.description === 'string') forge.description = body.description;
+        if (typeof body.default_branch === 'string' && forge.refs.has(`refs/heads/${body.default_branch}`)) forge.defaultBranch = body.default_branch;
+        sendJson(res, 200, forgeJson(forge));
         return true;
       }
       if (method === 'DELETE') {
-        repos.delete(name);
+        forges.delete(name);
         res.writeHead(204, { 'x-github-request-id': `req-${nextSeq()}` });
         res.end();
         return true;
@@ -899,25 +899,25 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, path: strin
     }
     const head = tail[0];
     if (head === 'branches' && method === 'GET' && tail.length === 1) {
-      const list = [...repo.refs.keys()].filter((r) => r.startsWith('refs/heads/')).map((r) => r.slice('refs/heads/'.length)).sort()
-        .map((b) => ({ name: b, commit: { sha: repo.refs.get(`refs/heads/${b}`) ?? ZERO_OID, url: `${repoPath}/commits/${repo.refs.get(`refs/heads/${b}`) ?? ''}` }, protected: false }));
+      const list = [...forge.refs.keys()].filter((r) => r.startsWith('refs/heads/')).map((r) => r.slice('refs/heads/'.length)).sort()
+        .map((b) => ({ name: b, commit: { sha: forge.refs.get(`refs/heads/${b}`) ?? ZERO_OID, url: `${forgePath}/commits/${forge.refs.get(`refs/heads/${b}`) ?? ''}` }, protected: false }));
       sendJson(res, 200, list);
       return true;
     }
     if (head === 'branches' && method === 'GET' && tail.length === 2) {
       const branch = dec(tail[1] as string);
-      const tip = repoTip(repo, branch);
+      const tip = forgeTip(forge, branch);
       if (!tip) { sendJson(res, 404, { message: 'Branch not found' }); return true; }
-      sendJson(res, 200, { name: branch, commit: { sha: tip, url: `${repoPath}/commits/${tip}` }, protected: false });
+      sendJson(res, 200, { name: branch, commit: { sha: tip, url: `${forgePath}/commits/${tip}` }, protected: false });
       return true;
     }
     if (head === 'commits' && method === 'GET') {
       const ref = q.get('sha') ?? undefined;
-      const tip = commitAtRef(repo, ref);
-      const list = commitsFrom(repo, tip).map(({ sha, commit }) => ({
-        sha, commit: { message: commit.message, author: { name: VIEWER.name, email: VIEWER.email, date: ISO_NOW }, committer: { name: VIEWER.name, email: VIEWER.email, date: ISO_NOW }, tree: { sha: commit.tree }, url: `${repoPath}/git/trees/${commit.tree}` },
+      const tip = commitAtRef(forge, ref);
+      const list = commitsFrom(forge, tip).map(({ sha, commit }) => ({
+        sha, commit: { message: commit.message, author: { name: VIEWER.name, email: VIEWER.email, date: ISO_NOW }, committer: { name: VIEWER.name, email: VIEWER.email, date: ISO_NOW }, tree: { sha: commit.tree }, url: `${forgePath}/git/trees/${commit.tree}` },
         author: { login: VIEWER.login, id: VIEWER.id, type: 'User' }, committer: { login: VIEWER.login, id: VIEWER.id, type: 'User' },
-        parents: commit.parents.map((p) => ({ sha: p })), url: `${repoPath}/commits/${sha}`,
+        parents: commit.parents.map((p) => ({ sha: p })), url: `${forgePath}/commits/${sha}`,
       }));
       const { page, link } = paginate(list, q, req, path);
       sendJson(res, 200, page, linkHeaders(link));
@@ -930,24 +930,24 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, path: strin
         const body = (parsed.value ?? {}) as Record<string, unknown>;
         const ref = typeof body.ref === 'string' ? body.ref : '';
         const sha = typeof body.sha === 'string' ? body.sha : '';
-        if (!ref.startsWith('refs/') || !isOid(sha) || !repo.objects.has(sha)) { sendJson(res, 422, { message: 'Validation Failed' }); return true; }
-        if (repo.refs.has(ref)) { sendJson(res, 422, { message: 'Reference already exists' }); return true; }
-        repo.refs.set(ref, sha);
-        invalidateFetchCache(repo);
-        sendJson(res, 201, { ref, node_id: globalId('RF', `${repo.dbId}:${ref}`), url: `${repoPath}/git/refs/${ref}`, object: { sha, type: repo.objects.get(sha)?.type ?? 'commit', url: `${repoPath}/git/${repo.objects.get(sha)?.type ?? 'commit'}s/${sha}` } });
+        if (!ref.startsWith('refs/') || !isOid(sha) || !forge.objects.has(sha)) { sendJson(res, 422, { message: 'Validation Failed' }); return true; }
+        if (forge.refs.has(ref)) { sendJson(res, 422, { message: 'Reference already exists' }); return true; }
+        forge.refs.set(ref, sha);
+        invalidateFetchCache(forge);
+        sendJson(res, 201, { ref, node_id: globalId('RF', `${forge.dbId}:${ref}`), url: `${forgePath}/git/refs/${ref}`, object: { sha, type: forge.objects.get(sha)?.type ?? 'commit', url: `${forgePath}/git/${forge.objects.get(sha)?.type ?? 'commit'}s/${sha}` } });
         return true;
       }
       if (method === 'GET') {
         const refPath = tail.slice(2).map(dec).join('/');
         if (refPath === '') {
-          const list = [...repo.refs.entries()].sort((a, b) => (a[0] < b[0] ? -1 : 1)).map(([ref, sha]) => ({ ref, node_id: globalId('RF', `${repo.dbId}:${ref}`), url: `${repoPath}/git/refs/${ref}`, object: { sha, type: repo.objects.get(sha)?.type ?? 'commit' } }));
+          const list = [...forge.refs.entries()].sort((a, b) => (a[0] < b[0] ? -1 : 1)).map(([ref, sha]) => ({ ref, node_id: globalId('RF', `${forge.dbId}:${ref}`), url: `${forgePath}/git/refs/${ref}`, object: { sha, type: forge.objects.get(sha)?.type ?? 'commit' } }));
           sendJson(res, 200, list);
           return true;
         }
         const full = `refs/${refPath}`;
-        const sha = repo.refs.get(full);
+        const sha = forge.refs.get(full);
         if (!sha) { sendJson(res, 404, { message: 'Not Found' }); return true; }
-        sendJson(res, 200, { ref: full, node_id: globalId('RF', `${repo.dbId}:${full}`), url: `${repoPath}/git/refs/${full}`, object: { sha, type: repo.objects.get(sha)?.type ?? 'commit' } });
+        sendJson(res, 200, { ref: full, node_id: globalId('RF', `${forge.dbId}:${full}`), url: `${forgePath}/git/refs/${full}`, object: { sha, type: forge.objects.get(sha)?.type ?? 'commit' } });
         return true;
       }
       sendJson(res, 404, { message: 'Not Found' });
@@ -957,27 +957,27 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, path: strin
       const filePath = tail.slice(1).map(dec).join('/');
       if (method === 'GET') {
         const ref = q.get('ref') ?? undefined;
-        const tip = commitAtRef(repo, ref);
+        const tip = commitAtRef(forge, ref);
         if (!tip) { sendJson(res, 404, { message: 'Not Found' }); return true; }
-        const commit = getCommit(repo, tip);
+        const commit = getCommit(forge, tip);
         if (!commit) { sendJson(res, 404, { message: 'Not Found' }); return true; }
         const treeOid = commit.tree;
         if (filePath === '') {
-          const entries = treeList(repo, treeOid, '') ?? [];
-          sendJson(res, 200, entries.map((e) => ({ type: e.mode === '40000' ? 'dir' : 'file', size: e.mode === '40000' ? 0 : (repo.objects.get(e.oid)?.data.length ?? 0), name: e.name, path: e.name, sha: e.oid, url: `${repoPath}/contents/${e.name}`, git_url: `${repoPath}/git/trees/${e.oid}`, html_url: `https://example.invalid/${owner}/${name}/blob/${repo.defaultBranch}/${e.name}`, download_url: null })));
+          const entries = treeList(forge, treeOid, '') ?? [];
+          sendJson(res, 200, entries.map((e) => ({ type: e.mode === '40000' ? 'dir' : 'file', size: e.mode === '40000' ? 0 : (forge.objects.get(e.oid)?.data.length ?? 0), name: e.name, path: e.name, sha: e.oid, url: `${forgePath}/contents/${e.name}`, git_url: `${forgePath}/git/trees/${e.oid}`, html_url: `https://example.invalid/${owner}/${name}/blob/${forge.defaultBranch}/${e.name}`, download_url: null })));
           return true;
         }
-        const found = treeGet(repo, treeOid, filePath);
+        const found = treeGet(forge, treeOid, filePath);
         if (!found) { sendJson(res, 404, { message: 'Not Found' }); return true; }
         if (found.mode === '40000') {
-          const entries = treeList(repo, treeOid, filePath) ?? [];
-          sendJson(res, 200, entries.map((e) => ({ type: e.mode === '40000' ? 'dir' : 'file', size: e.mode === '40000' ? 0 : (repo.objects.get(e.oid)?.data.length ?? 0), name: e.name, path: `${filePath}/${e.name}`, sha: e.oid, url: `${repoPath}/contents/${filePath}/${e.name}`, git_url: `${repoPath}/git/trees/${e.oid}`, html_url: `https://example.invalid/${owner}/${name}/blob/${repo.defaultBranch}/${filePath}/${e.name}`, download_url: null })));
+          const entries = treeList(forge, treeOid, filePath) ?? [];
+          sendJson(res, 200, entries.map((e) => ({ type: e.mode === '40000' ? 'dir' : 'file', size: e.mode === '40000' ? 0 : (forge.objects.get(e.oid)?.data.length ?? 0), name: e.name, path: `${filePath}/${e.name}`, sha: e.oid, url: `${forgePath}/contents/${filePath}/${e.name}`, git_url: `${forgePath}/git/trees/${e.oid}`, html_url: `https://example.invalid/${owner}/${name}/blob/${forge.defaultBranch}/${filePath}/${e.name}`, download_url: null })));
           return true;
         }
-        const blob = repo.objects.get(found.oid);
+        const blob = forge.objects.get(found.oid);
         if (!blob) { sendJson(res, 404, { message: 'Not Found' }); return true; }
         const baseName = filePath.split('/').pop() ?? filePath;
-        sendJson(res, 200, { type: 'file', encoding: 'base64', size: blob.data.length, name: baseName, path: filePath, content: b64(blob.data), sha: found.oid, url: `${repoPath}/contents/${filePath}`, git_url: `${repoPath}/git/blobs/${found.oid}`, html_url: `https://example.invalid/${owner}/${name}/blob/${repo.defaultBranch}/${filePath}`, download_url: null, _links: { self: `${repoPath}/contents/${filePath}`, git: `${repoPath}/git/blobs/${found.oid}`, html: `https://example.invalid/${owner}/${name}/blob/${repo.defaultBranch}/${filePath}` } });
+        sendJson(res, 200, { type: 'file', encoding: 'base64', size: blob.data.length, name: baseName, path: filePath, content: b64(blob.data), sha: found.oid, url: `${forgePath}/contents/${filePath}`, git_url: `${forgePath}/git/blobs/${found.oid}`, html_url: `https://example.invalid/${owner}/${name}/blob/${forge.defaultBranch}/${filePath}`, download_url: null, _links: { self: `${forgePath}/contents/${filePath}`, git: `${forgePath}/git/blobs/${found.oid}`, html: `https://example.invalid/${owner}/${name}/blob/${forge.defaultBranch}/${filePath}` } });
         return true;
       }
       if (method === 'PUT') {
@@ -986,30 +986,30 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, path: strin
         const body = (parsed.value ?? {}) as Record<string, unknown>;
         const message = typeof body.message === 'string' ? body.message : 'Update file';
         const contentB64 = typeof body.content === 'string' ? body.content : '';
-        const branch = typeof body.branch === 'string' ? body.branch : repo.defaultBranch;
+        const branch = typeof body.branch === 'string' ? body.branch : forge.defaultBranch;
         const shaField = typeof body.sha === 'string' ? body.sha : undefined;
         let content: Buffer;
         try { content = Buffer.from(contentB64.replace(/\s+/g, ''), 'base64'); } catch { sendJson(res, 422, { message: 'Validation Failed' }); return true; }
-        let tip = repoTip(repo, branch);
+        let tip = forgeTip(forge, branch);
         if (!tip) {
-          const baseTip = repoTip(repo, repo.defaultBranch);
-          if (baseTip) { repo.refs.set(`refs/heads/${branch}`, baseTip); tip = baseTip; }
-          else { repo.refs.set(`refs/heads/${branch}`, ZERO_OID); tip = null; }
+          const baseTip = forgeTip(forge, forge.defaultBranch);
+          if (baseTip) { forge.refs.set(`refs/heads/${branch}`, baseTip); tip = baseTip; }
+          else { forge.refs.set(`refs/heads/${branch}`, ZERO_OID); tip = null; }
         }
-        const baseCommit = tip ? getCommit(repo, tip) : null;
+        const baseCommit = tip ? getCommit(forge, tip) : null;
         const baseTree = baseCommit ? baseCommit.tree : null;
-        const existing = tip && baseTree ? treeGet(repo, baseTree, filePath) : null;
+        const existing = tip && baseTree ? treeGet(forge, baseTree, filePath) : null;
         if (existing) {
           if (!shaField) { sendJson(res, 422, { message: 'Validation Failed: sha must be provided to update a file' }); return true; }
           if (shaField.toLowerCase() !== existing.oid.toLowerCase()) { sendJson(res, 409, { message: 'Conflict: sha does not match' }); return true; }
         } else if (shaField) { sendJson(res, 409, { message: 'Conflict: sha does not match' }); return true; }
-        const blobOid = putObj(repo, 'blob', content);
-        const newTree = treeSet(repo, baseTree, filePath, blobOid);
+        const blobOid = putObj(forge, 'blob', content);
+        const newTree = treeSet(forge, baseTree, filePath, blobOid);
         const parents = tip && tip !== ZERO_OID ? [tip] : [];
-        const commitSha = makeCommit(repo, newTree, parents, message);
-        repo.refs.set(`refs/heads/${branch}`, commitSha);
-        invalidateFetchCache(repo);
-        sendJson(res, existing ? 200 : 201, { content: { name: filePath.split('/').pop() ?? filePath, path: filePath, sha: blobOid, size: content.length, url: `${repoPath}/contents/${filePath}`, git_url: `${repoPath}/git/blobs/${blobOid}`, html_url: `https://example.invalid/${owner}/${name}/blob/${branch}/${filePath}`, type: 'file', encoding: 'base64' }, commit: { sha: commitSha, message, author: { name: VIEWER.name, email: VIEWER.email, date: ISO_NOW }, committer: { name: VIEWER.name, email: VIEWER.email, date: ISO_NOW } } });
+        const commitSha = makeCommit(forge, newTree, parents, message);
+        forge.refs.set(`refs/heads/${branch}`, commitSha);
+        invalidateFetchCache(forge);
+        sendJson(res, existing ? 200 : 201, { content: { name: filePath.split('/').pop() ?? filePath, path: filePath, sha: blobOid, size: content.length, url: `${forgePath}/contents/${filePath}`, git_url: `${forgePath}/git/blobs/${blobOid}`, html_url: `https://example.invalid/${owner}/${name}/blob/${branch}/${filePath}`, type: 'file', encoding: 'base64' }, commit: { sha: commitSha, message, author: { name: VIEWER.name, email: VIEWER.email, date: ISO_NOW }, committer: { name: VIEWER.name, email: VIEWER.email, date: ISO_NOW } } });
         return true;
       }
       if (method === 'DELETE') {
@@ -1018,18 +1018,18 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, path: strin
         const body = (parsed.value ?? {}) as Record<string, unknown>;
         const message = typeof body.message === 'string' ? body.message : 'Delete file';
         const shaField = typeof body.sha === 'string' ? body.sha : undefined;
-        const branch = typeof body.branch === 'string' ? body.branch : repo.defaultBranch;
-        const tip = repoTip(repo, branch);
+        const branch = typeof body.branch === 'string' ? body.branch : forge.defaultBranch;
+        const tip = forgeTip(forge, branch);
         if (!tip) { sendJson(res, 404, { message: 'Not Found' }); return true; }
-        const baseCommit = getCommit(repo, tip);
+        const baseCommit = getCommit(forge, tip);
         if (!baseCommit) { sendJson(res, 404, { message: 'Not Found' }); return true; }
-        const existing = treeGet(repo, baseCommit.tree, filePath);
+        const existing = treeGet(forge, baseCommit.tree, filePath);
         if (!existing) { sendJson(res, 404, { message: 'Not Found' }); return true; }
         if (shaField && shaField.toLowerCase() !== existing.oid.toLowerCase()) { sendJson(res, 409, { message: 'Conflict: sha does not match' }); return true; }
-        const newTree = treeSet(repo, baseCommit.tree, filePath, null);
-        const commitSha = makeCommit(repo, newTree, [tip], message);
-        repo.refs.set(`refs/heads/${branch}`, commitSha);
-        invalidateFetchCache(repo);
+        const newTree = treeSet(forge, baseCommit.tree, filePath, null);
+        const commitSha = makeCommit(forge, newTree, [tip], message);
+        forge.refs.set(`refs/heads/${branch}`, commitSha);
+        invalidateFetchCache(forge);
         sendJson(res, 200, { commit: { sha: commitSha, message } });
         return true;
       }
@@ -1044,13 +1044,13 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, path: strin
         const name = typeof body.name === 'string' ? body.name : '';
         const color = typeof body.color === 'string' ? body.color.replace(/^#/, '') : 'ededed';
         if (name === '') { sendJson(res, 422, { message: 'Validation Failed' }); return true; }
-        if (repo.labels.has(name)) { sendJson(res, 422, { message: 'Validation Failed: label already exists' }); return true; }
-        repo.labels.set(name, { name, color });
-        sendJson(res, 201, { id: globalId('L', `${repo.dbId}:${name}`), node_id: globalId('L', `${repo.dbId}:${name}`), name, color, description: '', default: false, url: `${repoPath}/labels/${encodeURIComponent(name)}` });
+        if (forge.labels.has(name)) { sendJson(res, 422, { message: 'Validation Failed: label already exists' }); return true; }
+        forge.labels.set(name, { name, color });
+        sendJson(res, 201, { id: globalId('L', `${forge.dbId}:${name}`), node_id: globalId('L', `${forge.dbId}:${name}`), name, color, description: '', default: false, url: `${forgePath}/labels/${encodeURIComponent(name)}` });
         return true;
       }
       if (method === 'GET') {
-        sendJson(res, 200, [...repo.labels.values()].map((l) => ({ id: globalId('L', `${repo.dbId}:${l.name}`), node_id: globalId('L', `${repo.dbId}:${l.name}`), name: l.name, color: l.color, description: '', default: false, url: `${repoPath}/labels/${encodeURIComponent(l.name)}` })));
+        sendJson(res, 200, [...forge.labels.values()].map((l) => ({ id: globalId('L', `${forge.dbId}:${l.name}`), node_id: globalId('L', `${forge.dbId}:${l.name}`), name: l.name, color: l.color, description: '', default: false, url: `${forgePath}/labels/${encodeURIComponent(l.name)}` })));
         return true;
       }
       sendJson(res, 404, { message: 'Not Found' });
@@ -1066,29 +1066,29 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, path: strin
           if (title === '') { sendJson(res, 422, { message: 'Validation Failed: title is required' }); return true; }
           const labelNames: string[] = Array.isArray(body.labels) ? (body.labels as unknown[]).map((l) => typeof l === 'string' ? l : (l as Record<string, unknown>).name as string).filter((x): x is string => typeof x === 'string') : [];
           for (const ln of labelNames) {
-            if (!repo.labels.has(ln)) { sendJson(res, 422, { message: `Validation Failed: label ${ln} does not exist` }); return true; }
+            if (!forge.labels.has(ln)) { sendJson(res, 422, { message: `Validation Failed: label ${ln} does not exist` }); return true; }
           }
-          const number = repo.nextNumber;
-          repo.nextNumber += 1;
-          const issue: Issue = {
-            id: globalId('I', `${repo.dbId}:${number}`), number, title,
+          const number = forge.nextNumber;
+          forge.nextNumber += 1;
+          const ticket: Ticket = {
+            id: globalId('I', `${forge.dbId}:${number}`), number, title,
             body: typeof body.body === 'string' ? body.body : '',
-            state: 'open', labels: labelNames.map((n) => ({ name: n, color: repo.labels.get(n)?.color ?? 'ededed' })),
+            state: 'open', labels: labelNames.map((n) => ({ name: n, color: forge.labels.get(n)?.color ?? 'ededed' })),
             seq: nextSeq(), closedAt: null, comments: [], json: '', jsonLen: 0, labelJson: '', jsonOwner: null,
           };
-          addIssue(repo, issue);
-          sendJsonStr(res, 201, issue.json, issue.jsonLen);
+          addTicket(forge, ticket);
+          sendJsonStr(res, 201, ticket.json, ticket.jsonLen);
           return true;
         }
         if (method === 'GET') {
           const state = (q.get('state') ?? 'open').toLowerCase();
           const sort = (q.get('sort') ?? 'created').toLowerCase();
           const direction = (q.get('direction') ?? 'desc').toLowerCase();
-          let list = [...repo.issues];
+          let list = [...forge.tickets];
           if (state === 'open') list = list.filter((i) => i.state === 'open');
           else if (state === 'closed') list = list.filter((i) => i.state === 'closed');
           if (sort === 'created') list.sort((a, b) => direction === 'asc' ? a.seq - b.seq : b.seq - a.seq);
-          const { page, link } = paginate(list.map((i) => issueJson(repo, i)), q, req, path);
+          const { page, link } = paginate(list.map((i) => ticketJson(forge, i)), q, req, path);
           sendJson(res, 200, page, linkHeaders(link));
           return true;
         }
@@ -1096,45 +1096,45 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, path: strin
         return true;
       }
       const num = Number(tail[1]);
-      const issue = repo.issueByNumber.get(num);
+      const ticket = forge.ticketByNumber.get(num);
       if (tail.length === 2) {
-        if (!issue) { sendJson(res, 404, { message: 'Not Found' }); return true; }
+        if (!ticket) { sendJson(res, 404, { message: 'Not Found' }); return true; }
         if (method === 'GET') {
-          // Re-render only if the repo owner was bound after this issue was cached.
-          if (issue.jsonOwner !== (repo.owner ?? VIEWER.login)) refreshIssueJson(repo, issue);
-          sendJsonStr(res, 200, issue.json, issue.jsonLen);
+          // Re-render only if the forge owner was bound after this ticket was cached.
+          if (ticket.jsonOwner !== (forge.owner ?? VIEWER.login)) refreshTicketJson(forge, ticket);
+          sendJsonStr(res, 200, ticket.json, ticket.jsonLen);
           return true;
         }
         if (method === 'PATCH') {
           const parsed = await readJson(req);
           if (!parsed.ok) { sendJson(res, 400, { message: 'Problems parsing JSON' }); return true; }
           const body = (parsed.value ?? {}) as Record<string, unknown>;
-          if (typeof body.title === 'string') issue.title = body.title;
-          if (typeof body.body === 'string') issue.body = body.body;
-          if (body.state === 'open' || body.state === 'closed') { issue.state = body.state; issue.closedAt = body.state === 'closed' ? ISO_NOW : null; }
-          refreshIssueJson(repo, issue);
-          sendJsonStr(res, 200, issue.json, issue.jsonLen);
+          if (typeof body.title === 'string') ticket.title = body.title;
+          if (typeof body.body === 'string') ticket.body = body.body;
+          if (body.state === 'open' || body.state === 'closed') { ticket.state = body.state; ticket.closedAt = body.state === 'closed' ? ISO_NOW : null; }
+          refreshTicketJson(forge, ticket);
+          sendJsonStr(res, 200, ticket.json, ticket.jsonLen);
           return true;
         }
         sendJson(res, 404, { message: 'Not Found' });
         return true;
       }
       if (tail[2] === 'comments') {
-        if (!issue) { sendJson(res, 404, { message: 'Not Found' }); return true; }
+        if (!ticket) { sendJson(res, 404, { message: 'Not Found' }); return true; }
         if (method === 'POST') {
           const parsed = await readJson(req);
           if (!parsed.ok) { sendJson(res, 400, { message: 'Problems parsing JSON' }); return true; }
           const body = (parsed.value ?? {}) as Record<string, unknown>;
           const text = typeof body.body === 'string' ? body.body : '';
-          const comment = { id: repo.nextCommentId, body: text, createdAt: ISO_NOW };
-          repo.nextCommentId += 1;
-          issue.comments.push(comment);
-          refreshIssueJson(repo, issue);
-          sendJson(res, 201, { id: comment.id, node_id: globalId('C', `${repo.dbId}:${issue.number}:${comment.id}`), body: text, user: { login: VIEWER.login, id: VIEWER.id, type: 'User' }, created_at: ISO_NOW, updated_at: ISO_NOW, html_url: `https://example.invalid/${owner}/${name}/issues/${issue.number}#issuecomment-${comment.id}`, issue_url: `${repoPath}/issues/${issue.number}` });
+          const comment = { id: forge.nextCommentId, body: text, createdAt: ISO_NOW };
+          forge.nextCommentId += 1;
+          ticket.comments.push(comment);
+          refreshTicketJson(forge, ticket);
+          sendJson(res, 201, { id: comment.id, node_id: globalId('C', `${forge.dbId}:${ticket.number}:${comment.id}`), body: text, user: { login: VIEWER.login, id: VIEWER.id, type: 'User' }, created_at: ISO_NOW, updated_at: ISO_NOW, html_url: `https://example.invalid/${owner}/${name}/issues/${ticket.number}#issuecomment-${comment.id}`, issue_url: `${forgePath}/issues/${ticket.number}` });
           return true;
         }
         if (method === 'GET') {
-          sendJson(res, 200, issue.comments.map((c) => ({ id: c.id, node_id: globalId('C', `${repo.dbId}:${issue.number}:${c.id}`), body: c.body, user: { login: VIEWER.login, id: VIEWER.id, type: 'User' }, created_at: ISO_NOW, updated_at: ISO_NOW })));
+          sendJson(res, 200, ticket.comments.map((c) => ({ id: c.id, node_id: globalId('C', `${forge.dbId}:${ticket.number}:${c.id}`), body: c.body, user: { login: VIEWER.login, id: VIEWER.id, type: 'User' }, created_at: ISO_NOW, updated_at: ISO_NOW })));
           return true;
         }
         sendJson(res, 404, { message: 'Not Found' });
@@ -1150,32 +1150,32 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, path: strin
           if (!parsed.ok) { sendJson(res, 400, { message: 'Problems parsing JSON' }); return true; }
           const body = (parsed.value ?? {}) as Record<string, unknown>;
           const headRef = typeof body.head === 'string' ? body.head : '';
-          const baseRef = typeof body.base === 'string' ? body.base : repo.defaultBranch;
+          const baseRef = typeof body.base === 'string' ? body.base : forge.defaultBranch;
           const title = typeof body.title === 'string' ? body.title : '';
-          const headSha = repoTip(repo, headRef);
-          const baseSha = repoTip(repo, baseRef);
+          const headSha = forgeTip(forge, headRef);
+          const baseSha = forgeTip(forge, baseRef);
           if (!headSha || !baseSha) { sendJson(res, 422, { message: 'Validation Failed: head or base branch does not exist' }); return true; }
-          const existing = repo.pulls.find((p) => p.state === 'open' && p.headRef === headRef && p.baseRef === baseRef);
+          const existing = forge.pulls.find((p) => p.state === 'open' && p.headRef === headRef && p.baseRef === baseRef);
           if (existing) { sendJson(res, 422, { message: 'Validation Failed: a pull request already exists for this head and base', errors: [{ resource: 'PullRequest', code: 'custom', field: 'head', message: 'A pull request already exists' }] }); return true; }
-          const number = repo.nextNumber;
-          repo.nextNumber += 1;
+          const number = forge.nextNumber;
+          forge.nextNumber += 1;
           const pr: Pull = {
-            id: globalId('P', `${repo.dbId}:${number}`), number, title,
+            id: globalId('P', `${forge.dbId}:${number}`), number, title,
             body: typeof body.body === 'string' ? body.body : '',
             state: 'open', merged: false, mergedAt: null, mergeCommitSha: null,
             headRef, baseRef, headSha, baseSha, baseAtCreate: baseSha, seq: nextSeq(),
           };
-          repo.pulls.push(pr);
-          sendJson(res, 201, pullJson(repo, pr));
+          forge.pulls.push(pr);
+          sendJson(res, 201, pullJson(forge, pr));
           return true;
         }
         if (method === 'GET') {
           const state = (q.get('state') ?? 'open').toLowerCase();
-          let list = [...repo.pulls];
+          let list = [...forge.pulls];
           if (state === 'open') list = list.filter((p) => p.state === 'open');
           else if (state === 'closed') list = list.filter((p) => p.state === 'closed');
           list.sort((a, b) => b.seq - a.seq);
-          const { page, link } = paginate(list.map((p) => pullJson(repo, p)), q, req, path);
+          const { page, link } = paginate(list.map((p) => pullJson(forge, p)), q, req, path);
           sendJson(res, 200, page, linkHeaders(link));
           return true;
         }
@@ -1183,23 +1183,23 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, path: strin
         return true;
       }
       const num = Number(tail[1]);
-      const pr = repo.pulls.find((p) => p.number === num);
+      const pr = forge.pulls.find((p) => p.number === num);
       if (tail.length === 2) {
         if (!pr) { sendJson(res, 404, { message: 'Not Found' }); return true; }
-        if (method === 'GET') { sendJson(res, 200, pullJson(repo, pr)); return true; }
+        if (method === 'GET') { sendJson(res, 200, pullJson(forge, pr)); return true; }
         sendJson(res, 404, { message: 'Not Found' });
         return true;
       }
       if (tail[2] === 'files' && method === 'GET') {
         if (!pr) { sendJson(res, 404, { message: 'Not Found' }); return true; }
-        sendJson(res, 200, prFiles(repo, pr).map((f) => ({ ...f, sha: '', patch: '' })));
+        sendJson(res, 200, prFiles(forge, pr).map((f) => ({ ...f, sha: '', patch: '' })));
         return true;
       }
       if (tail[2] === 'merge' && method === 'PUT') {
         if (!pr) { sendJson(res, 404, { message: 'Not Found' }); return true; }
         if (pr.state !== 'open') { sendJson(res, 405, { message: 'Pull request is already closed' }); return true; }
-        if (!prMergeable(repo, pr)) { sendJson(res, 405, { message: 'Pull request is not mergeable' }); return true; }
-        const sha = squashMerge(repo, pr);
+        if (!prMergeable(forge, pr)) { sendJson(res, 405, { message: 'Pull request is not mergeable' }); return true; }
+        const sha = squashMerge(forge, pr);
         if (!sha) { sendJson(res, 405, { message: 'Pull request is not mergeable' }); return true; }
         pr.state = 'closed';
         pr.merged = true;
@@ -1226,25 +1226,25 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, path: strin
 }
 
 // ---------------------------------------------------------------- git smart HTTP
-function sortedRefs(repo: Repo): [string, string][] {
-  return [...repo.refs.entries()].sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
+function sortedRefs(forge: Forge): [string, string][] {
+  return [...forge.refs.entries()].sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
 }
-function v0Advertisement(repo: Repo, service: string): Buffer {
+function v0Advertisement(forge: Forge, service: string): Buffer {
   const caps = service === 'git-receive-pack'
     ? 'report-status side-band-64k delete-refs ofs-delta agent=forge/1.0'
     : 'side-band-64k thin-pack ofs-delta shallow multi_ack symref=HEAD:refs/heads/main agent=forge/1.0';
   const parts: Buffer[] = [pktLine(`# service=${service}\n`), PKT_FLUSH];
-  const refs = sortedRefs(repo);
-  const tip = repoTip(repo, repo.defaultBranch);
+  const refs = sortedRefs(forge);
+  const tip = forgeTip(forge, forge.defaultBranch);
   if (refs.length === 0) {
     parts.push(pktLine(`${ZERO_OID} capabilities^{}\0${caps}\n`));
   } else {
     parts.push(pktLine(`${tip ?? ZERO_OID} HEAD\0${caps}\n`));
     for (const [name, oid] of refs) {
       parts.push(pktLine(`${oid} ${name}\n`));
-      const obj = repo.objects.get(oid);
+      const obj = forge.objects.get(oid);
       if (obj && obj.type === 'tag') {
-        const target = getTag(repo, oid)?.object;
+        const target = getTag(forge, oid)?.object;
         if (target) parts.push(pktLine(`${target} ${name}^{}\n`));
       }
     }
@@ -1255,34 +1255,34 @@ function v0Advertisement(repo: Repo, service: string): Buffer {
 function v2Advertisement(): Buffer {
   return pktLines(['version 2\n', 'agent=forge/1.0\n', 'ls-refs=unborn\n', 'fetch=shallow thin-pack ofs-delta\n', 'object-format=sha1\n', 'flush']);
 }
-function treeClosure(repo: Repo, treeOid: string): Set<string> {
+function treeClosure(forge: Forge, treeOid: string): Set<string> {
   const out = new Set<string>();
   const queue: string[] = [treeOid];
   let head = 0;
   while (head < queue.length) {
     const oid = queue[head++] as string;
     if (out.has(oid)) continue;
-    const obj = repo.objects.get(oid);
+    const obj = forge.objects.get(oid);
     if (!obj) continue;
     out.add(oid);
     if (obj.type === 'tree') {
-      const entries = getTree(repo, oid);
+      const entries = getTree(forge, oid);
       if (entries) for (const e of entries) queue.push(e.oid);
     }
   }
   return out;
 }
-function fetchPlan(repo: Repo, wants: string[], haves: string[], depth: number | null, oldShallow: string[]): { send: Map<string, GitObj>; shallow: string[]; unshallow: string[] } {
+function fetchPlan(forge: Forge, wants: string[], haves: string[], depth: number | null, oldShallow: string[]): { send: Map<string, GitObj>; shallow: string[]; unshallow: string[] } {
   const oldShallowSet = new Set(oldShallow);
   const includedCommits = new Set<string>();
   const queue: { oid: string; d: number }[] = [];
   let qh = 0;
   const pushWant = (oid: string): void => {
-    const obj = repo.objects.get(oid);
+    const obj = forge.objects.get(oid);
     if (!obj) return;
     if (obj.type === 'tag') {
       includedCommits.add(oid);
-      const target = getTag(repo, oid)?.object;
+      const target = getTag(forge, oid)?.object;
       if (target) queue.push({ oid: target, d: 0 });
       return;
     }
@@ -1293,7 +1293,7 @@ function fetchPlan(repo: Repo, wants: string[], haves: string[], depth: number |
     const { oid, d } = queue[qh++] as { oid: string; d: number };
     if (includedCommits.has(oid)) continue;
     if (depth !== null && d >= depth) continue;
-    const c = getCommit(repo, oid);
+    const c = getCommit(forge, oid);
     if (!c) continue;
     includedCommits.add(oid);
     for (const p of c.parents) queue.push({ oid: p, d: d + 1 });
@@ -1301,10 +1301,10 @@ function fetchPlan(repo: Repo, wants: string[], haves: string[], depth: number |
   const included = new Set<string>();
   for (const oid of includedCommits) {
     included.add(oid);
-    const obj = repo.objects.get(oid);
+    const obj = forge.objects.get(oid);
     if (obj && obj.type === 'commit') {
-      const c = getCommit(repo, oid);
-      if (c) for (const o of treeClosure(repo, c.tree)) included.add(o);
+      const c = getCommit(forge, oid);
+      if (c) for (const o of treeClosure(forge, c.tree)) included.add(o);
     }
   }
   const held = new Set<string>();
@@ -1313,25 +1313,25 @@ function fetchPlan(repo: Repo, wants: string[], haves: string[], depth: number |
   let hh = 0;
   while (hh < hq.length) {
     const oid = hq[hh++] as string;
-    const coid = peelToCommit(repo, oid) ?? oid;
+    const coid = peelToCommit(forge, oid) ?? oid;
     if (heldCommits.has(coid)) continue;
-    const c = getCommit(repo, coid);
+    const c = getCommit(forge, coid);
     if (!c) continue;
     heldCommits.add(coid);
     held.add(coid);
-    for (const o of treeClosure(repo, c.tree)) held.add(o);
+    for (const o of treeClosure(forge, c.tree)) held.add(o);
     if (oldShallowSet.has(coid)) continue;
     for (const p of c.parents) hq.push(p);
   }
   const send = new Map<string, GitObj>();
   for (const oid of included) {
     if (held.has(oid)) continue;
-    const obj = repo.objects.get(oid);
+    const obj = forge.objects.get(oid);
     if (obj) send.set(oid, obj);
   }
   const shallow: string[] = [];
   for (const oid of includedCommits) {
-    const c = getCommit(repo, oid);
+    const c = getCommit(forge, oid);
     if (!c) continue;
     if (depth !== null && c.parents.some((p) => !includedCommits.has(p))) shallow.push(oid);
   }
@@ -1356,10 +1356,10 @@ async function handleGit(req: IncomingMessage, res: ServerResponse, path: string
   const owner = dec(m[1] as string);
   const name = dec(m[2] as string);
   const suffix = m[3] as string;
-  const repo = repoFor(owner, name);
+  const forge = forgeFor(owner, name);
   if (method === 'GET' && suffix.startsWith('/info/refs')) {
     const service = queryOfRaw(rawUrl).get('service') ?? '';
-    if (!repo) {
+    if (!forge) {
       res.writeHead(404, { 'content-type': 'text/plain' });
       res.end('Not found\n');
       return true;
@@ -1373,24 +1373,24 @@ async function handleGit(req: IncomingMessage, res: ServerResponse, path: string
     if (service === 'git-upload-pack' && (req.headers['git-protocol'] ?? '').includes('version=2')) {
       sendRaw(res, 200, v2Advertisement(), ct);
     } else {
-      sendRaw(res, 200, v0Advertisement(repo, service), ct);
+      sendRaw(res, 200, v0Advertisement(forge, service), ct);
     }
     return true;
   }
   if (method === 'POST' && (suffix === '/git-upload-pack' || suffix === '/git-receive-pack')) {
-    if (!repo) {
+    if (!forge) {
       res.writeHead(404, { 'content-type': 'text/plain' });
       res.end('Not found\n');
       return true;
     }
     const body = await readBody(req);
     const isV2 = (req.headers['git-protocol'] ?? '').includes('version=2');
-    if (suffix === '/git-upload-pack') return handleUploadPack(req, res, repo, body, isV2);
-    return handleReceivePack(req, res, repo, body);
+    if (suffix === '/git-upload-pack') return handleUploadPack(req, res, forge, body, isV2);
+    return handleReceivePack(req, res, forge, body);
   }
   return false;
 }
-async function handleUploadPack(req: IncomingMessage, res: ServerResponse, repo: Repo, body: Buffer, isV2: boolean): Promise<boolean> {
+async function handleUploadPack(req: IncomingMessage, res: ServerResponse, forge: Forge, body: Buffer, isV2: boolean): Promise<boolean> {
   const ct = 'application/x-git-upload-pack-result';
   if (isV2) {
     const decoded = decodePktLines(body);
@@ -1409,19 +1409,19 @@ async function handleUploadPack(req: IncomingMessage, res: ServerResponse, repo:
         else if (t === 'unborn') unborn = true;
       }
       const out: (string | 'flush')[] = [];
-      const refs = sortedRefs(repo);
-      const tip = repoTip(repo, repo.defaultBranch);
+      const refs = sortedRefs(forge);
+      const tip = forgeTip(forge, forge.defaultBranch);
       if (refs.length === 0) {
-        if (unborn) out.push(`unborn HEAD symref-target:refs/heads/${repo.defaultBranch}\n`);
+        if (unborn) out.push(`unborn HEAD symref-target:refs/heads/${forge.defaultBranch}\n`);
       } else {
         const all: { oid: string; name: string; peeled?: string; symrefTarget?: string }[] = [];
         if (tip && (prefixes.length === 0 || prefixes.some((p) => 'HEAD'.startsWith(p)))) {
-          all.push({ oid: tip as string, name: 'HEAD', symrefTarget: `refs/heads/${repo.defaultBranch}` });
+          all.push({ oid: tip as string, name: 'HEAD', symrefTarget: `refs/heads/${forge.defaultBranch}` });
         }
         for (const [rname, oid] of refs) {
           let peeled: string | undefined;
-          const obj = repo.objects.get(oid);
-          if (obj && obj.type === 'tag') peeled = getTag(repo, oid)?.object;
+          const obj = forge.objects.get(oid);
+          if (obj && obj.type === 'tag') peeled = getTag(forge, oid)?.object;
           all.push({ oid, name: rname, peeled });
         }
         for (const r of all) {
@@ -1453,12 +1453,12 @@ async function handleUploadPack(req: IncomingMessage, res: ServerResponse, repo:
       if (!done) {
         let common: string | null = null;
         for (const h of haves) {
-          const hc = peelToCommit(repo, h);
+          const hc = peelToCommit(forge, h);
           if (!hc) continue;
           for (const w of wants) {
-            const wc = peelToCommit(repo, w);
+            const wc = peelToCommit(forge, w);
             if (!wc) continue;
-            if (hc === wc || isAncestor(repo, hc, wc)) { common = hc; break; }
+            if (hc === wc || isAncestor(forge, hc, wc)) { common = hc; break; }
           }
           if (common) break;
         }
@@ -1471,10 +1471,10 @@ async function handleUploadPack(req: IncomingMessage, res: ServerResponse, repo:
       const cacheable = haves.length === 0 && shallowOld.length === 0 && wants.length > 0;
       const cacheKey = cacheable ? `v2|${wants.join(',')}|${depth === null ? '' : depth}` : '';
       if (cacheable) {
-        const hit = repo.fetchCache.get(cacheKey);
+        const hit = forge.fetchCache.get(cacheKey);
         if (hit) { sendRaw(res, 200, hit, ct); return true; }
       }
-      const plan = fetchPlan(repo, wants, haves, depth, shallowOld);
+      const plan = fetchPlan(forge, wants, haves, depth, shallowOld);
       const textParts: (string | 'delim')[] = [];
       if (plan.shallow.length > 0 || plan.unshallow.length > 0) {
         textParts.push('shallow-info\n');
@@ -1484,7 +1484,7 @@ async function handleUploadPack(req: IncomingMessage, res: ServerResponse, repo:
       }
       const pack = writePack([...plan.send.values()].map((o) => ({ type: o.type, data: o.data })));
       const out = Buffer.concat([pktLines(textParts), pktLine('packfile\n'), sidebandPack(pack), PKT_FLUSH]);
-      if (cacheable) repo.fetchCache.set(cacheKey, out);
+      if (cacheable) forge.fetchCache.set(cacheKey, out);
       sendRaw(res, 200, out, ct);
       return true;
     }
@@ -1506,10 +1506,10 @@ async function handleUploadPack(req: IncomingMessage, res: ServerResponse, repo:
   const cacheable = haves.length === 0 && shallowOld.length === 0 && wants.length > 0;
   const cacheKey = cacheable ? `v0|${wants.join(',')}|${depth === null ? '' : depth}` : '';
   if (cacheable) {
-    const hit = repo.fetchCache.get(cacheKey);
+    const hit = forge.fetchCache.get(cacheKey);
     if (hit) { sendRaw(res, 200, hit, 'application/x-git-upload-pack-result'); return true; }
   }
-  const plan = fetchPlan(repo, wants, haves, depth, shallowOld);
+  const plan = fetchPlan(forge, wants, haves, depth, shallowOld);
   const parts: Buffer[] = [pktLine('NAK\n')];
   for (const s of plan.shallow) parts.push(pktLine(`shallow ${s}\n`));
   for (const s of plan.unshallow) parts.push(pktLine(`unshallow ${s}\n`));
@@ -1519,11 +1519,11 @@ async function handleUploadPack(req: IncomingMessage, res: ServerResponse, repo:
   }
   parts.push(PKT_FLUSH);
   const out = Buffer.concat(parts);
-  if (cacheable) repo.fetchCache.set(cacheKey, out);
+  if (cacheable) forge.fetchCache.set(cacheKey, out);
   sendRaw(res, 200, out, ct);
   return true;
 }
-async function handleReceivePack(req: IncomingMessage, res: ServerResponse, repo: Repo, body: Buffer): Promise<boolean> {
+async function handleReceivePack(req: IncomingMessage, res: ServerResponse, forge: Forge, body: Buffer): Promise<boolean> {
   const ct = 'application/x-git-receive-pack-result';
   const report = (unpack: string, refs: { ref: string; ok: boolean; reason: string }[]): Buffer => {
     const lines: (string | 'flush')[] = [`unpack ${unpack}\n`];
@@ -1563,42 +1563,42 @@ async function handleReceivePack(req: IncomingMessage, res: ServerResponse, repo
       return true;
     }
     for (const e of entries) {
-      if (!repo.objects.has(e.oid)) repo.objects.set(e.oid, { type: e.type, data: e.data });
+      if (!forge.objects.has(e.oid)) forge.objects.set(e.oid, { type: e.type, data: e.data });
     }
   }
   const results: { ref: string; ok: boolean; reason: string }[] = [];
   let changed = false;
   for (const cmd of commands) {
-    const current = repo.refs.get(cmd.ref);
+    const current = forge.refs.get(cmd.ref);
     if (cmd.newOid === ZERO_OID) {
       if (!current) { results.push({ ref: cmd.ref, ok: false, reason: 'no such ref' }); continue; }
-      repo.refs.delete(cmd.ref);
+      forge.refs.delete(cmd.ref);
       changed = true;
       results.push({ ref: cmd.ref, ok: true, reason: '' });
       continue;
     }
-    const target = repo.objects.get(cmd.newOid);
+    const target = forge.objects.get(cmd.newOid);
     if (!target) { results.push({ ref: cmd.ref, ok: false, reason: 'missing object' }); continue; }
     if (!current) {
       if (cmd.oldOid !== ZERO_OID) { results.push({ ref: cmd.ref, ok: false, reason: 'non-fast-forward' }); continue; }
-      repo.refs.set(cmd.ref, cmd.newOid);
+      forge.refs.set(cmd.ref, cmd.newOid);
       changed = true;
       results.push({ ref: cmd.ref, ok: true, reason: '' });
       continue;
     }
     if (current.toLowerCase() !== cmd.oldOid.toLowerCase()) { results.push({ ref: cmd.ref, ok: false, reason: 'non-fast-forward' }); continue; }
     if (current === cmd.newOid) { results.push({ ref: cmd.ref, ok: true, reason: '' }); continue; }
-    const oldCommit = peelToCommit(repo, current);
-    const newCommit = peelToCommit(repo, cmd.newOid);
-    if (!oldCommit || !newCommit || !isAncestor(repo, oldCommit, newCommit)) {
+    const oldCommit = peelToCommit(forge, current);
+    const newCommit = peelToCommit(forge, cmd.newOid);
+    if (!oldCommit || !newCommit || !isAncestor(forge, oldCommit, newCommit)) {
       results.push({ ref: cmd.ref, ok: false, reason: 'non-fast-forward' });
       continue;
     }
-    repo.refs.set(cmd.ref, cmd.newOid);
+    forge.refs.set(cmd.ref, cmd.newOid);
     changed = true;
     results.push({ ref: cmd.ref, ok: true, reason: '' });
   }
-  if (changed) invalidateFetchCache(repo);
+  if (changed) invalidateFetchCache(forge);
   sendRaw(res, 200, report('ok', results), ct);
   return true;
 }
@@ -1839,35 +1839,35 @@ function connectionNodeFields(children: GqlField[]): GqlField[] {
   }
   return children;
 }
-function ownerGql(repo: Repo): Record<string, unknown> {
+function ownerGql(forge: Forge): Record<string, unknown> {
   return { id: globalId('U', 1000), login: VIEWER.login, databaseId: VIEWER.id, __typename: 'User' };
 }
-function issueGql(repo: Repo, issue: Issue, fields: GqlField[], errors: { message: string }[]): Record<string, unknown> {
+function ticketGql(forge: Forge, ticket: Ticket, fields: GqlField[], errors: { message: string }[]): Record<string, unknown> {
   return resolveGqlFields(fields, 'Issue', (f) => {
     switch (f.name) {
-      case 'id': return issue.id;
-      case 'databaseId': return issue.number;
-      case 'number': return issue.number;
-      case 'title': return issue.title;
-      case 'body': return issue.body;
-      case 'state': return issue.state === 'open' ? 'OPEN' : 'CLOSED';
-      case 'url': return `https://example.invalid/${repo.owner ?? VIEWER.login}/${repo.name}/issues/${issue.number}`;
+      case 'id': return ticket.id;
+      case 'databaseId': return ticket.number;
+      case 'number': return ticket.number;
+      case 'title': return ticket.title;
+      case 'body': return ticket.body;
+      case 'state': return ticket.state === 'open' ? 'OPEN' : 'CLOSED';
+      case 'url': return `https://example.invalid/${forge.owner ?? VIEWER.login}/${forge.name}/issues/${ticket.number}`;
       case 'createdAt': case 'updatedAt': return ISO_NOW;
-      case 'closedAt': return issue.closedAt;
+      case 'closedAt': return ticket.closedAt;
       case 'author': return { id: globalId('U', 1000), login: VIEWER.login, __typename: 'User' };
       case 'labels': {
-        const nodes = issue.labels.map((l) => ({ id: globalId('L', `${repo.dbId}:${l.name}`), name: l.name, color: l.color, description: '', __typename: 'Label' }));
+        const nodes = ticket.labels.map((l) => ({ id: globalId('L', `${forge.dbId}:${l.name}`), name: l.name, color: l.color, description: '', __typename: 'Label' }));
         return resolveGqlFields(f.children, 'LabelConnection' as never, () => null, errors) && { nodes, totalCount: nodes.length, pageInfo: { hasNextPage: false, hasPreviousPage: false, startCursor: null, endCursor: null }, __typename: 'LabelConnection' };
       }
       case 'comments': {
-        const nodes = issue.comments.map((c) => ({ id: globalId('C', `${repo.dbId}:${issue.number}:${c.id}`), body: c.body, author: { id: globalId('U', 1000), login: VIEWER.login, __typename: 'User' }, createdAt: ISO_NOW, __typename: 'IssueComment' }));
+        const nodes = ticket.comments.map((c) => ({ id: globalId('C', `${forge.dbId}:${ticket.number}:${c.id}`), body: c.body, author: { id: globalId('U', 1000), login: VIEWER.login, __typename: 'User' }, createdAt: ISO_NOW, __typename: 'IssueComment' }));
         return { nodes, totalCount: nodes.length, pageInfo: { hasNextPage: false, hasPreviousPage: false, startCursor: null, endCursor: null }, __typename: 'IssueCommentConnection' };
       }
       default: return null;
     }
   }, errors);
 }
-function prGql(repo: Repo, pr: Pull, fields: GqlField[], errors: { message: string }[]): Record<string, unknown> {
+function prGql(forge: Forge, pr: Pull, fields: GqlField[], errors: { message: string }[]): Record<string, unknown> {
   return resolveGqlFields(fields, 'PullRequest', (f) => {
     switch (f.name) {
       case 'id': return pr.id;
@@ -1877,15 +1877,15 @@ function prGql(repo: Repo, pr: Pull, fields: GqlField[], errors: { message: stri
       case 'body': return pr.body;
       case 'state': return pr.merged ? 'MERGED' : pr.state === 'open' ? 'OPEN' : 'CLOSED';
       case 'merged': return pr.merged;
-      case 'mergeable': return pr.state === 'open' ? (prMergeable(repo, pr) ? 'MERGEABLE' : 'CONFLICTING') : 'UNKNOWN';
+      case 'mergeable': return pr.state === 'open' ? (prMergeable(forge, pr) ? 'MERGEABLE' : 'CONFLICTING') : 'UNKNOWN';
       case 'headRefName': return pr.headRef;
       case 'baseRefName': return pr.baseRef;
-      case 'url': return `https://example.invalid/${repo.owner ?? VIEWER.login}/${repo.name}/pull/${pr.number}`;
+      case 'url': return `https://example.invalid/${forge.owner ?? VIEWER.login}/${forge.name}/pull/${pr.number}`;
       case 'createdAt': case 'updatedAt': return ISO_NOW;
       case 'mergedAt': return pr.mergedAt;
       case 'author': return { id: globalId('U', 1000), login: VIEWER.login, __typename: 'User' };
       case 'files': {
-        const files = prFiles(repo, pr).map((x) => ({ path: x.filename, additions: x.additions, deletions: x.deletions, __typename: 'PullRequestChangedFile' }));
+        const files = prFiles(forge, pr).map((x) => ({ path: x.filename, additions: x.additions, deletions: x.deletions, __typename: 'PullRequestChangedFile' }));
         const first = typeof f.args.first === 'number' ? f.args.first : files.length;
         return { nodes: files.slice(0, first), totalCount: files.length, pageInfo: { hasNextPage: files.length > first, hasPreviousPage: false, startCursor: null, endCursor: null }, __typename: 'PullRequestChangedFileConnection' };
       }
@@ -1894,36 +1894,36 @@ function prGql(repo: Repo, pr: Pull, fields: GqlField[], errors: { message: stri
     }
   }, errors);
 }
-function repoGql(repo: Repo, fields: GqlField[], errors: { message: string }[]): Record<string, unknown> {
+function forgeGql(forge: Forge, fields: GqlField[], errors: { message: string }[]): Record<string, unknown> {
   return resolveGqlFields(fields, 'Repository', (f) => {
     switch (f.name) {
-      case 'id': return repoGlobalId(repo);
-      case 'databaseId': return repo.dbId;
-      case 'name': return repo.name;
-      case 'nameWithOwner': return `${repo.owner ?? VIEWER.login}/${repo.name}`;
-      case 'description': return repo.description;
-      case 'owner': return ownerGql(repo);
+      case 'id': return forgeGlobalId(forge);
+      case 'databaseId': return forge.dbId;
+      case 'name': return forge.name;
+      case 'nameWithOwner': return `${forge.owner ?? VIEWER.login}/${forge.name}`;
+      case 'description': return forge.description;
+      case 'owner': return ownerGql(forge);
       case 'defaultBranchRef': {
-        const tip = repoTip(repo, repo.defaultBranch);
+        const tip = forgeTip(forge, forge.defaultBranch);
         return resolveGqlFields(f.children, 'Ref', (rf) => {
-          if (rf.name === 'name') return repo.defaultBranch;
+          if (rf.name === 'name') return forge.defaultBranch;
           if (rf.name === 'target') return { oid: tip, __typename: 'Commit' };
           return null;
         }, errors);
       }
       case 'viewerPermission': return 'ADMIN';
       case 'hasIssuesEnabled': return true;
-      case 'url': return `https://example.invalid/${repo.owner ?? VIEWER.login}/${repo.name}`;
+      case 'url': return `https://example.invalid/${forge.owner ?? VIEWER.login}/${forge.name}`;
       case 'createdAt': case 'updatedAt': return ISO_NOW;
       case 'issue': {
         const n = typeof f.args.number === 'number' ? f.args.number : -1;
-        const issue = repo.issueByNumber.get(n);
-        return issue ? issueGql(repo, issue, f.children, errors) : null;
+        const ticket = forge.ticketByNumber.get(n);
+        return ticket ? ticketGql(forge, ticket, f.children, errors) : null;
       }
       case 'issues': {
         const states = Array.isArray(f.args.states) ? (f.args.states as string[]) : [];
         const orderBy = (f.args.orderBy ?? {}) as Record<string, unknown>;
-        let list = [...repo.issues];
+        let list = [...forge.tickets];
         if (states.includes('OPEN')) list = list.filter((i) => i.state === 'open');
         if (states.includes('CLOSED')) list = list.filter((i) => i.state === 'closed');
         if (orderBy.field === 'CREATED_AT') list.sort((a, b) => orderBy.direction === 'ASC' ? a.seq - b.seq : b.seq - a.seq);
@@ -1934,18 +1934,18 @@ function repoGql(repo: Repo, fields: GqlField[], errors: { message: string }[]):
         const filtered = after < 0 ? list : list.filter((i) => dir === 'ASC' ? i.seq > after : i.seq < after);
         const page = filtered.slice(0, first);
         const nodeFields = connectionNodeFields(f.children);
-        const nodes = page.map((i) => issueGql(repo, i, nodeFields, errors));
-        const edges = page.map((i) => ({ node: issueGql(repo, i, nodeFields, errors), cursor: encodeCursor(i.seq) }));
+        const nodes = page.map((i) => ticketGql(forge, i, nodeFields, errors));
+        const edges = page.map((i) => ({ node: ticketGql(forge, i, nodeFields, errors), cursor: encodeCursor(i.seq) }));
         return { nodes, edges, totalCount: list.length, pageInfo: { hasNextPage: filtered.length > first, hasPreviousPage: after >= 0, startCursor: page.length ? encodeCursor(page[0]?.seq ?? 0) : null, endCursor: page.length ? encodeCursor(page[page.length - 1]?.seq ?? 0) : null }, __typename: 'IssueConnection' };
       }
       case 'pullRequest': {
         const n = typeof f.args.number === 'number' ? f.args.number : -1;
-        const pr = repo.pulls.find((p) => p.number === n);
-        return pr ? prGql(repo, pr, f.children, errors) : null;
+        const pr = forge.pulls.find((p) => p.number === n);
+        return pr ? prGql(forge, pr, f.children, errors) : null;
       }
       case 'pullRequests': {
         const states = Array.isArray(f.args.states) ? (f.args.states as string[]) : [];
-        let list = [...repo.pulls];
+        let list = [...forge.pulls];
         if (states.includes('OPEN')) list = list.filter((p) => p.state === 'open');
         if (states.includes('CLOSED')) list = list.filter((p) => p.state === 'closed');
         if (states.includes('MERGED')) list = list.filter((p) => p.merged);
@@ -1955,8 +1955,8 @@ function repoGql(repo: Repo, fields: GqlField[], errors: { message: string }[]):
         const filtered = list.filter((p) => p.seq < after || after < 0);
         const page = filtered.slice(0, first);
         const nodeFields = connectionNodeFields(f.children);
-        const nodes = page.map((p) => prGql(repo, p, nodeFields, errors));
-        const edges = page.map((p) => ({ node: prGql(repo, p, nodeFields, errors), cursor: encodeCursor(p.seq) }));
+        const nodes = page.map((p) => prGql(forge, p, nodeFields, errors));
+        const edges = page.map((p) => ({ node: prGql(forge, p, nodeFields, errors), cursor: encodeCursor(p.seq) }));
         return { nodes, edges, totalCount: list.length, pageInfo: { hasNextPage: filtered.length > first, hasPreviousPage: after >= 0, startCursor: page.length ? encodeCursor(page[0]?.seq ?? 0) : null, endCursor: page.length ? encodeCursor(page[page.length - 1]?.seq ?? 0) : null }, __typename: 'PullRequestConnection' };
       }
       default: return null;
@@ -2018,8 +2018,8 @@ function resolveTopLevel(op: GqlOperation, errors: { message: string }[]): Recor
     if (f.name === 'repository') {
       const owner = typeof f.args.owner === 'string' ? f.args.owner : '';
       const name = typeof f.args.name === 'string' ? f.args.name : '';
-      const repo = repoFor(owner, name);
-      out[f.alias ?? f.name] = repo ? repoGql(repo, f.children, errors) : null;
+      const forge = forgeFor(owner, name);
+      out[f.alias ?? f.name] = forge ? forgeGql(forge, f.children, errors) : null;
       continue;
     }
     if (f.name === 'node') {
@@ -2027,22 +2027,22 @@ function resolveTopLevel(op: GqlOperation, errors: { message: string }[]): Recor
       const decoded = decodeGlobalId(id);
       if (!decoded) { out[f.alias ?? f.name] = null; continue; }
       if (decoded.kind === 'R') {
-        const repo = [...repos.values()].find((r) => r.dbId === decoded.dbId);
-        out[f.alias ?? f.name] = repo ? repoGql(repo, f.children, errors) : null;
+        const forge = [...forges.values()].find((r) => r.dbId === decoded.dbId);
+        out[f.alias ?? f.name] = forge ? forgeGql(forge, f.children, errors) : null;
         continue;
       }
       if (decoded.kind === 'I') {
         const [dbId, num] = decoded.rest.split(':').map(Number);
-        const repo = [...repos.values()].find((r) => r.dbId === dbId);
-        const issue = repo?.issueByNumber.get(num);
-        out[f.alias ?? f.name] = repo && issue ? issueGql(repo, issue, f.children, errors) : null;
+        const forge = [...forges.values()].find((r) => r.dbId === dbId);
+        const ticket = forge?.ticketByNumber.get(num);
+        out[f.alias ?? f.name] = forge && ticket ? ticketGql(forge, ticket, f.children, errors) : null;
         continue;
       }
       if (decoded.kind === 'P') {
         const [dbId, num] = decoded.rest.split(':').map(Number);
-        const repo = [...repos.values()].find((r) => r.dbId === dbId);
-        const pr = repo?.pulls.find((p) => p.number === num);
-        out[f.alias ?? f.name] = repo && pr ? prGql(repo, pr, f.children, errors) : null;
+        const forge = [...forges.values()].find((r) => r.dbId === dbId);
+        const pr = forge?.pulls.find((p) => p.number === num);
+        out[f.alias ?? f.name] = forge && pr ? prGql(forge, pr, f.children, errors) : null;
         continue;
       }
       out[f.alias ?? f.name] = null;
@@ -2055,10 +2055,10 @@ function resolveTopLevel(op: GqlOperation, errors: { message: string }[]): Recor
       let nodes: Record<string, unknown>[] = [];
       if (type === 'ISSUE') {
         const nodeFields = connectionNodeFields(f.children);
-        for (const repo of repos.values()) {
-          for (const issue of repo.issues) {
-            if (query && !(issue.title.includes(query) || issue.body.includes(query))) continue;
-            nodes.push(issueGql(repo, issue, nodeFields, errors));
+        for (const forge of forges.values()) {
+          for (const ticket of forge.tickets) {
+            if (query && !(ticket.title.includes(query) || ticket.body.includes(query))) continue;
+            nodes.push(ticketGql(forge, ticket, nodeFields, errors));
           }
         }
       }
@@ -2069,14 +2069,14 @@ function resolveTopLevel(op: GqlOperation, errors: { message: string }[]): Recor
       const input = (f.args.input ?? {}) as Record<string, unknown>;
       const repoId = typeof input.repositoryId === 'string' ? input.repositoryId : '';
       const decoded = decodeGlobalId(repoId);
-      const repo = decoded ? [...repos.values()].find((r) => r.dbId === decoded.dbId) : undefined;
-      if (!repo) { errors.push(gqlError('Repository not found')); out[f.alias ?? f.name] = null; continue; }
-      const number = repo.nextNumber;
-      repo.nextNumber += 1;
-      const issue: Issue = { id: globalId('I', `${repo.dbId}:${number}`), number, title: typeof input.title === 'string' ? input.title : '', body: typeof input.body === 'string' ? input.body : '', state: 'open', labels: [], seq: nextSeq(), closedAt: null, comments: [], json: '', jsonLen: 0, labelJson: '', jsonOwner: null };
-      addIssue(repo, issue);
+      const forge = decoded ? [...forges.values()].find((r) => r.dbId === decoded.dbId) : undefined;
+      if (!forge) { errors.push(gqlError('Repository not found')); out[f.alias ?? f.name] = null; continue; }
+      const number = forge.nextNumber;
+      forge.nextNumber += 1;
+      const ticket: Ticket = { id: globalId('I', `${forge.dbId}:${number}`), number, title: typeof input.title === 'string' ? input.title : '', body: typeof input.body === 'string' ? input.body : '', state: 'open', labels: [], seq: nextSeq(), closedAt: null, comments: [], json: '', jsonLen: 0, labelJson: '', jsonOwner: null };
+      addTicket(forge, ticket);
       out[f.alias ?? f.name] = resolveGqlFields(f.children, 'CreateIssuePayload', (sf) => {
-        if (sf.name === 'issue') return issueGql(repo, issue, sf.children, errors);
+        if (sf.name === 'issue') return ticketGql(forge, ticket, sf.children, errors);
         if (sf.name === 'clientMutationId') return typeof input.clientMutationId === 'string' ? input.clientMutationId : null;
         return null;
       }, errors);
@@ -2086,19 +2086,19 @@ function resolveTopLevel(op: GqlOperation, errors: { message: string }[]): Recor
       const input = (f.args.input ?? {}) as Record<string, unknown>;
       const issueId = typeof input.issueId === 'string' ? input.issueId : '';
       const decoded = decodeGlobalId(issueId);
-      let target: { repo: Repo; issue: Issue } | undefined;
+      let target: { forge: Forge; ticket: Ticket } | undefined;
       if (decoded && decoded.kind === 'I') {
         const [dbId, num] = decoded.rest.split(':').map(Number);
-        const repo = [...repos.values()].find((r) => r.dbId === dbId);
-        const issue = repo?.issueByNumber.get(num);
-        if (repo && issue) target = { repo, issue };
+        const forge = [...forges.values()].find((r) => r.dbId === dbId);
+        const ticket = forge?.ticketByNumber.get(num);
+        if (forge && ticket) target = { forge, ticket };
       }
       if (!target) { errors.push(gqlError('Issue not found')); out[f.alias ?? f.name] = null; continue; }
-      target.issue.state = 'closed';
-      target.issue.closedAt = ISO_NOW;
-      refreshIssueJson(target.repo, target.issue);
+      target.ticket.state = 'closed';
+      target.ticket.closedAt = ISO_NOW;
+      refreshTicketJson(target.forge, target.ticket);
       out[f.alias ?? f.name] = resolveGqlFields(f.children, 'CloseIssuePayload', (sf) => {
-        if (sf.name === 'issue') return issueGql(target.repo, target.issue, sf.children, errors);
+        if (sf.name === 'issue') return ticketGql(target.forge, target.ticket, sf.children, errors);
         if (sf.name === 'clientMutationId') return typeof input.clientMutationId === 'string' ? input.clientMutationId : null;
         return null;
       }, errors);
@@ -2108,19 +2108,19 @@ function resolveTopLevel(op: GqlOperation, errors: { message: string }[]): Recor
       const input = (f.args.input ?? {}) as Record<string, unknown>;
       const repoId = typeof input.repositoryId === 'string' ? input.repositoryId : '';
       const decoded = decodeGlobalId(repoId);
-      const repo = decoded ? [...repos.values()].find((r) => r.dbId === decoded.dbId) : undefined;
-      if (!repo) { errors.push(gqlError('Repository not found')); out[f.alias ?? f.name] = null; continue; }
+      const forge = decoded ? [...forges.values()].find((r) => r.dbId === decoded.dbId) : undefined;
+      if (!forge) { errors.push(gqlError('Repository not found')); out[f.alias ?? f.name] = null; continue; }
       const headRef = typeof input.headRefName === 'string' ? input.headRefName : '';
-      const baseRef = typeof input.baseRefName === 'string' ? input.baseRefName : repo.defaultBranch;
-      const headSha = repoTip(repo, headRef);
-      const baseSha = repoTip(repo, baseRef);
+      const baseRef = typeof input.baseRefName === 'string' ? input.baseRefName : forge.defaultBranch;
+      const headSha = forgeTip(forge, headRef);
+      const baseSha = forgeTip(forge, baseRef);
       if (!headSha || !baseSha) { errors.push(gqlError('head or base branch does not exist')); out[f.alias ?? f.name] = null; continue; }
-      const number = repo.nextNumber;
-      repo.nextNumber += 1;
-      const pr: Pull = { id: globalId('P', `${repo.dbId}:${number}`), number, title: typeof input.title === 'string' ? input.title : '', body: typeof input.body === 'string' ? input.body : '', state: 'open', merged: false, mergedAt: null, mergeCommitSha: null, headRef, baseRef, headSha, baseSha, baseAtCreate: baseSha, seq: nextSeq() };
-      repo.pulls.push(pr);
+      const number = forge.nextNumber;
+      forge.nextNumber += 1;
+      const pr: Pull = { id: globalId('P', `${forge.dbId}:${number}`), number, title: typeof input.title === 'string' ? input.title : '', body: typeof input.body === 'string' ? input.body : '', state: 'open', merged: false, mergedAt: null, mergeCommitSha: null, headRef, baseRef, headSha, baseSha, baseAtCreate: baseSha, seq: nextSeq() };
+      forge.pulls.push(pr);
       out[f.alias ?? f.name] = resolveGqlFields(f.children, 'CreatePullRequestPayload', (sf) => {
-        if (sf.name === 'pullRequest') return prGql(repo, pr, sf.children, errors);
+        if (sf.name === 'pullRequest') return prGql(forge, pr, sf.children, errors);
         if (sf.name === 'clientMutationId') return typeof input.clientMutationId === 'string' ? input.clientMutationId : null;
         return null;
       }, errors);
@@ -2130,16 +2130,16 @@ function resolveTopLevel(op: GqlOperation, errors: { message: string }[]): Recor
       const input = (f.args.input ?? {}) as Record<string, unknown>;
       const prId = typeof input.pullRequestId === 'string' ? input.pullRequestId : '';
       const decoded = decodeGlobalId(prId);
-      let target: { repo: Repo; pr: Pull } | undefined;
+      let target: { forge: Forge; pr: Pull } | undefined;
       if (decoded && decoded.kind === 'P') {
         const [dbId, num] = decoded.rest.split(':').map(Number);
-        const repo = [...repos.values()].find((r) => r.dbId === dbId);
-        const pr = repo?.pulls.find((p) => p.number === num);
-        if (repo && pr) target = { repo, pr };
+        const forge = [...forges.values()].find((r) => r.dbId === dbId);
+        const pr = forge?.pulls.find((p) => p.number === num);
+        if (forge && pr) target = { forge, pr };
       }
       if (!target) { errors.push(gqlError('Pull request not found')); out[f.alias ?? f.name] = null; continue; }
-      const { repo, pr } = target;
-      if (pr.state !== 'open' || !prMergeable(repo, pr) || !squashMerge(repo, pr)) {
+      const { forge, pr } = target;
+      if (pr.state !== 'open' || !prMergeable(forge, pr) || !squashMerge(forge, pr)) {
         errors.push(gqlError('Pull request is not mergeable'));
         out[f.alias ?? f.name] = null;
         continue;
@@ -2149,7 +2149,7 @@ function resolveTopLevel(op: GqlOperation, errors: { message: string }[]): Recor
       pr.mergedAt = ISO_NOW;
       pr.mergeCommitSha = pr.baseSha;
       out[f.alias ?? f.name] = resolveGqlFields(f.children, 'MergePullRequestPayload', (sf) => {
-        if (sf.name === 'pullRequest') return prGql(repo, pr, sf.children, errors);
+        if (sf.name === 'pullRequest') return prGql(forge, pr, sf.children, errors);
         if (sf.name === 'clientMutationId') return typeof input.clientMutationId === 'string' ? input.clientMutationId : null;
         return null;
       }, errors);
@@ -2160,20 +2160,20 @@ function resolveTopLevel(op: GqlOperation, errors: { message: string }[]): Recor
       const subjectId = typeof input.subjectId === 'string' ? input.subjectId : '';
       const body = typeof input.body === 'string' ? input.body : '';
       const decoded = decodeGlobalId(subjectId);
-      let target: { repo: Repo; issue: Issue } | undefined;
+      let target: { forge: Forge; ticket: Ticket } | undefined;
       if (decoded && decoded.kind === 'I') {
         const [dbId, num] = decoded.rest.split(':').map(Number);
-        const repo = [...repos.values()].find((r) => r.dbId === dbId);
-        const issue = repo?.issueByNumber.get(num);
-        if (repo && issue) target = { repo, issue };
+        const forge = [...forges.values()].find((r) => r.dbId === dbId);
+        const ticket = forge?.ticketByNumber.get(num);
+        if (forge && ticket) target = { forge, ticket };
       }
       if (!target) { errors.push(gqlError('Subject not found')); out[f.alias ?? f.name] = null; continue; }
-      const comment = { id: target.repo.nextCommentId, body, createdAt: ISO_NOW };
-      target.repo.nextCommentId += 1;
-      target.issue.comments.push(comment);
-      refreshIssueJson(target.repo, target.issue);
+      const comment = { id: target.forge.nextCommentId, body, createdAt: ISO_NOW };
+      target.forge.nextCommentId += 1;
+      target.ticket.comments.push(comment);
+      refreshTicketJson(target.forge, target.ticket);
       out[f.alias ?? f.name] = resolveGqlFields(f.children, 'AddCommentPayload', (sf) => {
-        if (sf.name === 'commentEdge') return { node: { id: globalId('C', `${target.repo.dbId}:${target.issue.number}:${comment.id}`), body, author: { id: globalId('U', 1000), login: VIEWER.login, __typename: 'User' }, __typename: 'IssueComment' }, cursor: encodeCursor(comment.id) };
+        if (sf.name === 'commentEdge') return { node: { id: globalId('C', `${target.forge.dbId}:${target.ticket.number}:${comment.id}`), body, author: { id: globalId('U', 1000), login: VIEWER.login, __typename: 'User' }, __typename: 'IssueComment' }, cursor: encodeCursor(comment.id) };
         if (sf.name === 'clientMutationId') return typeof input.clientMutationId === 'string' ? input.clientMutationId : null;
         return null;
       }, errors);
@@ -2278,48 +2278,48 @@ async function handleMcp(req: IncomingMessage, res: ServerResponse): Promise<boo
 }
 function callMcpTool(name: string, args: Record<string, unknown>): Record<string, unknown> | null {
   const owner = typeof args.owner === 'string' ? args.owner : VIEWER.login;
-  const repoName = typeof args.repo === 'string' ? args.repo : (typeof args.name === 'string' ? args.name : '');
+  const forgeName = typeof args.repo === 'string' ? args.repo : (typeof args.name === 'string' ? args.name : '');
   if (name === 'create_repo') {
     const rname = typeof args.name === 'string' ? args.name : '';
     if (rname === '') throw new Error('name is required');
-    if (repos.has(rname)) throw new Error('Repository already exists');
-    const repo = newRepo(rname, false, '');
-    return repoJson(repo);
+    if (forges.has(rname)) throw new Error('Repository already exists');
+    const forge = newForge(rname, false, '');
+    return forgeJson(forge);
   }
-  const repo = repoFor(owner, repoName);
-  if (!repo) return null;
-  if (name === 'get_repo') return repoJson(repo);
+  const forge = forgeFor(owner, forgeName);
+  if (!forge) return null;
+  if (name === 'get_repo') return forgeJson(forge);
   if (name === 'create_issue') {
     const title = typeof args.title === 'string' ? args.title : '';
-    const number = repo.nextNumber;
-    repo.nextNumber += 1;
-    const issue: Issue = { id: globalId('I', `${repo.dbId}:${number}`), number, title, body: typeof args.body === 'string' ? args.body : '', state: 'open', labels: [], seq: nextSeq(), closedAt: null, comments: [], json: '', jsonLen: 0, labelJson: '', jsonOwner: null };
-    addIssue(repo, issue);
-    return issueJson(repo, issue);
+    const number = forge.nextNumber;
+    forge.nextNumber += 1;
+    const ticket: Ticket = { id: globalId('I', `${forge.dbId}:${number}`), number, title, body: typeof args.body === 'string' ? args.body : '', state: 'open', labels: [], seq: nextSeq(), closedAt: null, comments: [], json: '', jsonLen: 0, labelJson: '', jsonOwner: null };
+    addTicket(forge, ticket);
+    return ticketJson(forge, ticket);
   }
   if (name === 'list_issues') {
     const state = typeof args.state === 'string' ? args.state : 'open';
-    return { issues: repo.issues.filter((i) => state === 'all' ? true : i.state === state).map((i) => issueJson(repo, i)) };
+    return { issues: forge.tickets.filter((i) => state === 'all' ? true : i.state === state).map((i) => ticketJson(forge, i)) };
   }
   if (name === 'create_pull_request') {
     const headRef = typeof args.head === 'string' ? args.head : '';
-    const baseRef = typeof args.base === 'string' ? args.base : repo.defaultBranch;
-    const headSha = repoTip(repo, headRef);
-    const baseSha = repoTip(repo, baseRef);
+    const baseRef = typeof args.base === 'string' ? args.base : forge.defaultBranch;
+    const headSha = forgeTip(forge, headRef);
+    const baseSha = forgeTip(forge, baseRef);
     if (!headSha || !baseSha) throw new Error('head or base branch does not exist');
-    const existing = repo.pulls.find((p) => p.state === 'open' && p.headRef === headRef && p.baseRef === baseRef);
+    const existing = forge.pulls.find((p) => p.state === 'open' && p.headRef === headRef && p.baseRef === baseRef);
     if (existing) throw new Error('A pull request already exists for this head and base');
-    const number = repo.nextNumber;
-    repo.nextNumber += 1;
-    const pr: Pull = { id: globalId('P', `${repo.dbId}:${number}`), number, title: typeof args.title === 'string' ? args.title : '', body: typeof args.body === 'string' ? args.body : '', state: 'open', merged: false, mergedAt: null, mergeCommitSha: null, headRef, baseRef, headSha, baseSha, baseAtCreate: baseSha, seq: nextSeq() };
-    repo.pulls.push(pr);
-    return pullJson(repo, pr);
+    const number = forge.nextNumber;
+    forge.nextNumber += 1;
+    const pr: Pull = { id: globalId('P', `${forge.dbId}:${number}`), number, title: typeof args.title === 'string' ? args.title : '', body: typeof args.body === 'string' ? args.body : '', state: 'open', merged: false, mergedAt: null, mergeCommitSha: null, headRef, baseRef, headSha, baseSha, baseAtCreate: baseSha, seq: nextSeq() };
+    forge.pulls.push(pr);
+    return pullJson(forge, pr);
   }
   if (name === 'merge_pull_request') {
     const number = typeof args.number === 'number' ? args.number : Number(args.number);
-    const pr = repo.pulls.find((p) => p.number === number);
+    const pr = forge.pulls.find((p) => p.number === number);
     if (!pr) return null;
-    if (pr.state !== 'open' || !prMergeable(repo, pr) || !squashMerge(repo, pr)) throw new Error('Pull request is not mergeable');
+    if (pr.state !== 'open' || !prMergeable(forge, pr) || !squashMerge(forge, pr)) throw new Error('Pull request is not mergeable');
     pr.state = 'closed';
     pr.merged = true;
     pr.mergedAt = ISO_NOW;
@@ -2384,3 +2384,4 @@ function isMain(): boolean {
   try { return new URL(import.meta.url).pathname === entry; } catch { return false; }
 }
 if (isMain()) void start();
+export { forges };
